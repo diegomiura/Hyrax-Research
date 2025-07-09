@@ -1,2 +1,6 @@
-/testing_data/
 .DS_Store
+__pycache__/
+*.pyc
+.env
+# The split_images folder is really large, so avoid pushing this to git
+/stuff/split_images
