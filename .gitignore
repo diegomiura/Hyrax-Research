@@ -4,3 +4,8 @@ __pycache__/
 .env
 # The split_images folder is really large, so avoid pushing this to git
 /stuff/split_images
+# Folders made my running similarity search on `hyrax_notebook.ipynb`
+None/
+results/
+# Test Directory
+test_dir/
