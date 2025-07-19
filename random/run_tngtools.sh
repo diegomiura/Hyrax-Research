@@ -33,7 +33,7 @@ echo "Splitting FITS files…"
 
 tng-split split \
   --url-list all_file_urls.txt \
-  --batch-size 500 \
+  --batch-size 1000 \
   --split-output-dir split_images \
   --remove-parent \
   --catalog-path catalog.fits --api-key 3849226db021fa31e0fd58651b7c943f
