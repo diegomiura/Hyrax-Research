@@ -18,24 +18,19 @@ source activate hyrax      # or `conda activate hyrax`
 
 echo "Loaded modules"
 
-# ——— set your API key ———
-# Option A: if you have it in ~/.env
-# export $(grep -v '^#' ~/.env | xargs)
-# Option B: hardcode (not recommended)
-# export TNG50_API_KEY="3849226db021fa31e0fd58651b7c943f"
-
 # ——— run TNG-Tools steps ———
 echo "Generating URL list…"
 tng-gen-urls \
+  --output 1000_file_urls.txt \
   --api-key 3849226db021fa31e0fd58651b7c943f \
 
 echo "Splitting FITS files…"
 
 tng-split split \
-  --url-list all_file_urls.txt \
+  --url-list 1000_file_urls.txt \
   --batch-size 1000 \
   --split-output-dir split_images \
   --remove-parent \
-  --catalog-path catalog.fits --api-key 3849226db021fa31e0fd58651b7c943f
+  --catalog-path 1000x5_catalog.fits --api-key 3849226db021fa31e0fd58651b7c943f
 
 echo "Done!"
