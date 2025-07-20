@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=b1000     #job name
-#SBATCH --output=batch1000.txt
 #SBATCH --partition=cpu  # e.g. general, debug, etc.
 #SBATCH --nodes=1
-#SBATCH --time=00:30:00          # hh:mm:ss walltime
+#SBATCH --time=01:00:00          # hh:mm:ss walltime
+#SBATCH --cpus-per-task=1    # <- match to OMP_NUM_THREADS
 #SBATCH --mem=4G                 # adjust as needed
 #SBATCH --account=bemi-delta-cpu    # <- match to a "Project" returned by the "accounts" command
 #SBATCH --output=slurm-%j.out
