@@ -3,11 +3,11 @@ __pycache__/
 *.pyc
 .env
 # The split_images folder is really large, so avoid pushing this to git
-/stuff/split_images
+/data/split_images
 # Folders made my running similarity search on `hyrax_notebook.ipynb`
 None/
 results/
 # Test Directory
 test_dir/
 # Random test file
-stuff/skirt_images_hsc_idealized_v0_72.hdf5
+data/skirt_images_hsc_idealized_v0_72.hdf5
