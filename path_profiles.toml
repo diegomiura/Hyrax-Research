@@ -1,0 +1,32 @@
+# Version-controlled path profiles for running this repo in different places.
+#
+# Edit roots here instead of hardcoding machine-specific paths in notebooks.
+# The helper in research_paths.py expands values like "{data_root}/split_images".
+
+[profiles.local]
+description = "Local workstation profile"
+
+[profiles.local.paths]
+data_root = "{repo_root}/test_dir_100images"
+split_images = "{data_root}/split_images"
+split_images_120 = "{data_root}/split_images_120"
+hyrax_runs = "{data_root}/hyrax_runs"
+hyrax_results = "{hyrax_runs}/results"
+catalog_all = "{split_images}/catalog.fits"
+catalog_raw_merger_flags = "{split_images}/catalog2.fits"
+catalog_le_120x120 = "{split_images}/catalog_le_120x120.fits"
+catalog_gt_120x120 = "{split_images}/catalog_gt_120x120.fits"
+
+[profiles.delta]
+description = "Delta HPC profile"
+
+[profiles.delta.paths]
+data_root = "/work/hdd/bemi/dmiura/data_downloads/tng100_snap72"
+split_images = "{data_root}/split_images"
+split_images_120 = "{data_root}/split_images_120"
+hyrax_runs = "{data_root}/hyrax_runs"
+hyrax_results = "{hyrax_runs}/results"
+catalog_all = "{split_images}/catalog.fits"
+catalog_raw_merger_flags = "{split_images}/catalog2.fits"
+catalog_le_120x120 = "{split_images}/catalog_le_120x120.fits"
+catalog_gt_120x120 = "{split_images}/catalog_gt_120x120.fits"

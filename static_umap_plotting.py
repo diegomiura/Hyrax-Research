@@ -2,10 +2,19 @@ from collections.abc import Mapping
 from pathlib import Path
 import re
 
-def extract_umap_info(x,y,base_directory="/work/hdd/bemi/dmiura/data_downloads/tng100_snap72/hyrax_runs"):
+def _default_hyrax_runs_dir():
+  from research_paths import paths
+
+  return paths.hyrax_runs
+
+
+def extract_umap_info(x,y,base_directory=None):
   """Extract UMAP directory from 3dumap output file."""
 
   # Construct paths
+  if base_directory is None:
+      base_directory = _default_hyrax_runs_dir()
+
   run_dir = Path(base_directory) / f"run{x}"
   dumap_name = f"udb{x}_{y}"
 
@@ -320,7 +329,7 @@ def _load_toml(path):
 def extract_umap_and_inference_info(
     x,
     y,
-    base_directory="/work/hdd/bemi/dmiura/data_downloads/tng100_snap72/hyrax_runs",
+    base_directory=None,
 ):
     """Extract UMAP, inference, and config paths for a run/experiment pair."""
     umap_dir, config_file = extract_umap_info(x, y, base_directory=base_directory)

@@ -9,5 +9,15 @@ None/
 results/
 # Test Directory
 test_dir/
+test_dir*/
 # Random test file
 data/skirt_images_hsc_idealized_v0_72.hdf5
+
+# Generated/local analysis data and artifacts
+/color_testing/
+/color_testing_backup/
+/color_testing.tar.gz
+/data/*.fits
+/data/*.hdf5
+/config.toml
+/cutout_size_histogram.png
