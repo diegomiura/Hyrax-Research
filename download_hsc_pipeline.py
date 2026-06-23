@@ -5,15 +5,21 @@ This module exposes two primary operations:
     * fetch: collect and store the list of available parent FITS file URLs.
     * split: download parent FITS files, optionally split them into filters,
       and write an optional Hyrax-compatible catalog.
+    * analyze-sizes: inspect a directory of FITS cutouts and summarize their
+      size distribution.
 Use ``python download_hsc_pipeline.py --help`` for invocation details.
 """
 
 #-------------Imports-------------#
 
+import csv
 import os
-import requests
-import time
 import re
+import time
+from collections import Counter
+from pathlib import Path
+
+import requests
 from astropy.io import fits
 from astropy.table import Table
 import argparse
@@ -227,6 +233,134 @@ def download_and_split_hsc_images(
         print(f' 📄 wrote catalog with {len(catalog_entries)} entries to {catalog_path}')
 
 
+def analyze_cutout_sizes(
+    input_dir='split_images',
+    output_plot=None,
+    output_csv=None,
+    bins=30,
+    pattern='*.fits'
+):
+    '''
+    Inspect FITS cutouts in a directory and summarize their size distribution.
+
+    Args:
+        input_dir (str, optional): Directory containing FITS cutouts. Defaults to 'split_images'.
+        output_plot (str, optional): Path for the histogram image. Defaults to
+            '<input_dir>/cutout_size_histogram.png'.
+        output_csv (str, optional): Path for the CSV summary of exact size counts.
+            Defaults to '<input_dir>/cutout_size_summary.csv'.
+        bins (int, optional): Number of histogram bins to use. Defaults to 30.
+        pattern (str, optional): Glob pattern used to select files. Defaults to '*.fits'.
+    '''
+    input_path = Path(input_dir).expanduser().resolve()
+    if not input_path.exists():
+        raise SystemExit(f'Input directory does not exist: {input_path}')
+    if not input_path.is_dir():
+        raise SystemExit(f'Input path is not a directory: {input_path}')
+
+    files = sorted(path for path in input_path.glob(pattern) if path.is_file())
+    if not files:
+        raise SystemExit(f'No files matched {pattern!r} in {input_path}')
+
+    measurements = []
+    skipped_files = []
+
+    for path in files:
+        try:
+            with fits.open(path, memmap=True) as hdul:
+                header = hdul[0].header
+                naxis = int(header.get('NAXIS', 0))
+                if naxis < 2:
+                    skipped_files.append((path.name, f'NAXIS={naxis}'))
+                    continue
+
+                width = int(header['NAXIS1'])
+                height = int(header['NAXIS2'])
+                measurements.append({
+                    'filename': path.name,
+                    'width': width,
+                    'height': height,
+                    'pixel_area': width * height
+                })
+        except Exception as exc:
+            skipped_files.append((path.name, str(exc)))
+
+    if not measurements:
+        raise SystemExit(f'No 2D FITS cutouts were found in {input_path}')
+
+    if bins <= 0:
+        raise SystemExit('--bins must be a positive integer')
+
+    if output_plot is None:
+        output_plot_path = input_path / 'cutout_size_histogram.png'
+    else:
+        output_plot_path = Path(output_plot).expanduser()
+
+    if output_csv is None:
+        output_csv_path = input_path / 'cutout_size_summary.csv'
+    else:
+        output_csv_path = Path(output_csv).expanduser()
+
+    if not output_plot_path.is_absolute():
+        output_plot_path = Path.cwd() / output_plot_path
+    if not output_csv_path.is_absolute():
+        output_csv_path = Path.cwd() / output_csv_path
+
+    output_plot_path.parent.mkdir(parents=True, exist_ok=True)
+    output_csv_path.parent.mkdir(parents=True, exist_ok=True)
+
+    width_values = [row['width'] for row in measurements]
+    height_values = [row['height'] for row in measurements]
+    area_values = [row['pixel_area'] for row in measurements]
+    size_counts = Counter((row['width'], row['height']) for row in measurements)
+
+    with output_csv_path.open('w', newline='') as handle:
+        writer = csv.writer(handle)
+        writer.writerow(['width', 'height', 'pixel_area', 'count'])
+        for (width, height), count in sorted(size_counts.items()):
+            writer.writerow([width, height, width * height, count])
+
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise SystemExit(
+            f'Generating the histogram requires matplotlib to be installed: {exc}'
+        ) from exc
+
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
+    plot_specs = [
+        ('Width distribution', 'Width (pixels)', width_values, '#4C72B0'),
+        ('Height distribution', 'Height (pixels)', height_values, '#55A868'),
+        ('Area distribution', 'Pixel area', area_values, '#C44E52'),
+    ]
+
+    for ax, (title, xlabel, values, color) in zip(axes, plot_specs):
+        ax.hist(values, bins=min(bins, len(values)), color=color, edgecolor='black')
+        ax.set_title(title)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel('Count')
+
+    fig.suptitle(f'Cutout size distribution ({len(measurements)} FITS files)')
+    fig.savefig(output_plot_path, dpi=200)
+    plt.close(fig)
+
+    print(f'Analyzed {len(measurements)} FITS files from {input_path}')
+    print(f'Histogram written to {output_plot_path}')
+    print(f'Summary CSV written to {output_csv_path}')
+    print(f'Width range: {min(width_values)} to {max(width_values)} pixels')
+    print(f'Height range: {min(height_values)} to {max(height_values)} pixels')
+    print(f'Unique size pairs: {len(size_counts)}')
+
+    if skipped_files:
+        print(f'Skipped {len(skipped_files)} file(s) that were not readable 2D FITS cutouts')
+
+    print('Most common cutout sizes:')
+    for (width, height), count in size_counts.most_common(10):
+        print(f'  {width}x{height}: {count}')
+
+
 def _resolve_api_key(explicit, command_name):
     """Return the API key provided or fallback to the ``TNG_API_KEY`` environment variable."""
     api_key = explicit or os.environ.get('TNG_API_KEY')
@@ -327,6 +461,37 @@ def build_parser():
         help='Directory to store downloaded parent FITS files. Defaults to the split output directory.'
     )
 
+    analyze_parser = subparsers.add_parser(
+        'analyze-sizes',
+        help='Analyze the FITS cutout size distribution in a directory.'
+    )
+    analyze_parser.add_argument(
+        '--input-dir',
+        default='split_images',
+        help='Directory containing FITS cutouts. Default: split_images'
+    )
+    analyze_parser.add_argument(
+        '--output-plot',
+        default=None,
+        help='Path for the histogram image. Defaults to <input_dir>/cutout_size_histogram.png'
+    )
+    analyze_parser.add_argument(
+        '--output-csv',
+        default=None,
+        help='Path for the CSV summary. Defaults to <input_dir>/cutout_size_summary.csv'
+    )
+    analyze_parser.add_argument(
+        '--bins',
+        type=int,
+        default=30,
+        help='Number of histogram bins. Default: 30'
+    )
+    analyze_parser.add_argument(
+        '--pattern',
+        default='*.fits',
+        help='Glob pattern used to select FITS files. Default: *.fits'
+    )
+
     return parser
 
 
@@ -356,6 +521,14 @@ def main(argv=None):
             catalog_path=args.catalog_path,
             parent_file_only=args.parent_file_only,
             parent_output_dir=args.parent_output_dir
+        )
+    elif args.command == 'analyze-sizes':
+        analyze_cutout_sizes(
+            input_dir=args.input_dir,
+            output_plot=args.output_plot,
+            output_csv=args.output_csv,
+            bins=args.bins,
+            pattern=args.pattern
         )
     else:
         parser.error('Unknown command provided.')
