@@ -7,6 +7,9 @@ into batchable scripts:
   metrics CSV, overlay-summary CSV, and a JSON record.
 - `static_umap_metric_job_generator.py` writes Slurm job scripts that call the
   analysis script for many run/experiment pairs.
+- `static_umap_metric_run_script_generator.ipynb` is a notebook wrapper for
+  previewing the plan, writing scripts, submitting already-written scripts, and
+  viewing result tables/PNGs.
 
 ## Quick Start On Delta
 
@@ -28,9 +31,32 @@ Submit the generated scripts:
 HYRAX_PROFILE=delta python static_umap_metric_job_generator.py submit
 ```
 
+Submit already-generated scripts without rewriting them:
+
+```bash
+HYRAX_PROFILE=delta python static_umap_metric_job_generator.py submit-existing
+```
+
 The generator writes scripts into each run directory, for example
 `run10/plot_metrics10_7.sh`. Each script writes its Slurm log beside the script,
 for example `run10/plot_metrics10_7.txt`.
+
+## Notebook Wrapper
+
+Open `static_umap_metric_run_script_generator.ipynb` on Delta when you want a
+notebook control panel. The notebook calls the same generator script rather than
+duplicating the metric logic. Its cells are ordered as:
+
+1. Configure the Delta paths, run/experiment plan, overlay groups, Slurm
+   overrides, and metric settings.
+2. Preview the generator plan.
+3. Write Slurm scripts.
+4. Dry-run `submit-existing`.
+5. Submit only when `SUBMIT_JOBS = True`.
+6. Display available result CSV summaries, PNGs, and recent Slurm log snippets.
+
+Leave `RUN_EXPTS` and `OVERLAY_GROUPS` empty in the notebook to use the default
+per-run plan listed below.
 
 ## Defaults
 

@@ -18,7 +18,7 @@ from pathlib import Path
 import shlex
 import subprocess
 import time
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -342,6 +342,33 @@ def create_jobs(args: argparse.Namespace) -> list[Path]:
     return created
 
 
+def expected_job_paths(args: argparse.Namespace) -> list[Path]:
+    """Return the Slurm script paths implied by the selected run plan."""
+    base_directory = resolve_base_directory(args.profile, args.base_directory)
+    plan = resolve_plan(args)
+
+    paths: list[Path] = []
+    for item in plan:
+        run = int(item["run"])
+        run_dir = base_directory / f"run{run}"
+        for expt in item["experiments"]:
+            paths.append(run_dir / f"{args.job_prefix}{run}_{int(expt)}.sh")
+    return paths
+
+
+def existing_job_paths(args: argparse.Namespace) -> list[Path]:
+    """Return expected job paths, raising a clear error if any are missing."""
+    job_paths = expected_job_paths(args)
+    missing = [path for path in job_paths if not path.exists()]
+    if missing:
+        missing_text = "\n".join(f"  - {path}" for path in missing)
+        raise FileNotFoundError(
+            "Expected Slurm scripts do not exist. Run the generator with the "
+            f"'write' action first, or check --base-directory/--job-prefix.\n{missing_text}"
+        )
+    return job_paths
+
+
 def print_plan(args: argparse.Namespace) -> None:
     base_directory = resolve_base_directory(args.profile, args.base_directory)
     output_dir = resolve_output_directory(args.output_dir, base_directory)
@@ -380,7 +407,12 @@ def positive_int(value: str) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate Slurm scripts for batch static UMAP metric jobs.")
-    parser.add_argument("action", nargs="?", choices=["print-plan", "write", "submit"], default="write")
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["print-plan", "write", "submit", "submit-existing"],
+        default="write",
+    )
     parser.add_argument(
         "--run-expts",
         action="append",
@@ -420,7 +452,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--setup-line", action="append", help="Setup line in the Slurm script. Repeat for multiple lines.")
     parser.add_argument("--no-default-setup", action="store_true", help="Do not include commented default setup lines.")
     parser.add_argument("--pause-after-first-seconds", type=int, default=10)
-    parser.add_argument("--dry-run", action="store_true", help="For submit action, print sbatch commands without running them.")
+    parser.add_argument("--dry-run", action="store_true", help="For submit actions, print sbatch commands without running them.")
     return parser
 
 
@@ -430,6 +462,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.action == "print-plan":
         print_plan(args)
+        return 0
+
+    if args.action == "submit-existing":
+        submit_jobs(
+            existing_job_paths(args),
+            pause_after_first_seconds=args.pause_after_first_seconds,
+            dry_run=args.dry_run,
+        )
         return 0
 
     job_paths = create_jobs(args)
