@@ -41,8 +41,26 @@ duplicating the repeated Run 10 time-since section:
   `time_since_merger` and `future_merger_flags`.
 - Run 11: experiments `7,10,12,13,14`, overlay group `time_since_merger`.
 
-The default catalog is `raw_merger_flags`, which resolves through
-`research_paths.py` to `catalog2.fits` on the selected profile.
+The default catalog key is `all`, matching
+`static_umap_plotting_time_since_merger_by_type.ipynb`. For this workflow,
+`all` resolves to the full time-since-merger catalog:
+
+```text
+/work/hdd/bemi/dmiura/data_downloads/tng100_snap72/split_images/catalog2.fits
+```
+
+`catalog2.fits` is assumed to already contain the cross-matched/merger columns.
+The batch workflow does not look for or load separate xmatch catalogs.
+
+Generated products default to:
+
+```text
+/work/hdd/bemi/dmiura/data_downloads/tng100_snap72/hyrax_runs/static_umap_metrics/
+```
+
+The default Slurm resources match the attached `train10_11.sh` style:
+`account=bemi-delta-gpu`, `partition=gpuA40x4`, `nodes=1`,
+`cpus-per-gpu=5`, `mem=50G`, `gpus=1`, and `time=5:00:00`.
 
 ## Common Customizations
 
@@ -69,8 +87,9 @@ Override Slurm resources:
 python static_umap_metric_job_generator.py write \
   --slurm partition=cpu \
   --slurm account=YOUR_ACCOUNT \
-  --slurm cpus-per-task=8 \
+  --slurm cpus-per-gpu=8 \
   --slurm mem=64G \
+  --slurm gpus=1 \
   --slurm time=4:00:00
 ```
 
@@ -98,7 +117,7 @@ python static_umap_metrics.py \
   --run 10 \
   --expt 12 \
   --profile delta \
-  --catalog-key raw_merger_flags \
+  --catalog-key all \
   --overlay-group time_since_merger
 ```
 
@@ -107,7 +126,7 @@ List detected overlay groups for a catalog:
 ```bash
 python static_umap_metrics.py \
   --profile delta \
-  --catalog-key raw_merger_flags \
+  --catalog-key all \
   --list-overlays
 ```
 
@@ -116,7 +135,7 @@ python static_umap_metrics.py \
 For run `10`, experiment `12`, outputs are written under:
 
 ```text
-results/static_umap_metrics/run10/expt12/
+/work/hdd/bemi/dmiura/data_downloads/tng100_snap72/hyrax_runs/static_umap_metrics/run10/expt12/
 ```
 
 Files include:

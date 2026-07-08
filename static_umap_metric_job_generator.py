@@ -23,7 +23,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 THIS_DIR = Path(__file__).resolve().parent
 DEFAULT_ANALYSIS_SCRIPT = THIS_DIR / "static_umap_metrics.py"
-DEFAULT_OUTPUT_DIR = THIS_DIR / "results" / "static_umap_metrics"
+DEFAULT_CATALOG_KEY = "all"
 
 DEFAULT_NOTEBOOK_PLAN = [
     {
@@ -42,20 +42,19 @@ DEFAULT_SLURM = {
     "account": "bemi-delta-gpu",
     "partition": "gpuA40x4",
     "nodes": 1,
-    "ntasks": 1,
-    "cpus-per-task": 4,
-    "mem": "32G",
-    "time": "2:00:00",
+    "cpus-per-gpu": 5,
+    "mem": "50G",
+    "gpus": 1,
+    "time": "5:00:00",
 }
 
-DEFAULT_SHELL_PREAMBLE = ["set -euo pipefail"]
+DEFAULT_SHELL_PREAMBLE: list[str] = []
 DEFAULT_SETUP_LINES = [
+    "# conda activate hyrax",
     'export MPLCONFIGDIR="${TMPDIR:-/tmp}/matplotlib-${SLURM_JOB_ID:-manual}"',
     'export NUMBA_CACHE_DIR="${TMPDIR:-/tmp}/numba-${SLURM_JOB_ID:-manual}"',
     'mkdir -p "$MPLCONFIGDIR"',
     'mkdir -p "$NUMBA_CACHE_DIR"',
-    "# source /mmfs1/home/aritrag/.bashrc",
-    "# conda activate hyrax",
 ]
 
 
@@ -80,9 +79,8 @@ def render_slurm_script(
     shell_preamble: Sequence[str] | None = None,
     setup_lines: Sequence[str] | None = None,
 ) -> str:
-    directives = deepcopy(dict(slurm))
-    directives["job-name"] = job_name
-    directives["output"] = output_file
+    directives = {"job-name": job_name, "output": output_file}
+    directives.update(deepcopy(dict(slurm)))
 
     lines = ["#!/bin/bash", "#"]
     for key, value in directives.items():
@@ -182,6 +180,13 @@ def resolve_base_directory(profile: str | None, base_directory: str | Path | Non
     return load_default_base_directory(profile)
 
 
+def resolve_output_directory(output_dir: str | Path | None, base_directory: Path) -> Path:
+    """Default analysis products to the selected Hyrax runs tree."""
+    if output_dir:
+        return Path(output_dir).expanduser()
+    return base_directory / "static_umap_metrics"
+
+
 def resolve_plan(args: argparse.Namespace) -> list[dict[str, Any]]:
     explicit_runs = parse_run_expts(args.run_expts)
     if explicit_runs:
@@ -215,6 +220,7 @@ def build_analysis_command(
     expt: int,
     overlay_groups: Sequence[str],
     base_directory: Path,
+    output_dir: Path,
 ) -> str:
     command = [
         args.python_executable,
@@ -226,7 +232,7 @@ def build_analysis_command(
         "--base-directory",
         str(base_directory),
         "--output-dir",
-        str(Path(args.output_dir).expanduser().resolve()),
+        str(output_dir),
         "--catalog-key",
         args.catalog_key,
         "--n-permutations",
@@ -304,6 +310,7 @@ def create_job_file(
 
 def create_jobs(args: argparse.Namespace) -> list[Path]:
     base_directory = resolve_base_directory(args.profile, args.base_directory)
+    output_dir = resolve_output_directory(args.output_dir, base_directory)
     plan = resolve_plan(args)
     slurm = deepcopy(DEFAULT_SLURM)
     _deep_update(slurm, parse_key_value_overrides(args.slurm))
@@ -319,7 +326,7 @@ def create_jobs(args: argparse.Namespace) -> list[Path]:
         run_dir = base_directory / f"run{run}"
         overlay_groups = list(item["overlay_groups"])
         for expt in item["experiments"]:
-            command = build_analysis_command(args, run, int(expt), overlay_groups, base_directory)
+            command = build_analysis_command(args, run, int(expt), overlay_groups, base_directory, output_dir)
             script_path = create_job_file(
                 run_dir=run_dir,
                 run=run,
@@ -337,13 +344,14 @@ def create_jobs(args: argparse.Namespace) -> list[Path]:
 
 def print_plan(args: argparse.Namespace) -> None:
     base_directory = resolve_base_directory(args.profile, args.base_directory)
+    output_dir = resolve_output_directory(args.output_dir, base_directory)
     plan = resolve_plan(args)
     slurm = deepcopy(DEFAULT_SLURM)
     _deep_update(slurm, parse_key_value_overrides(args.slurm))
 
     print(f"Analysis script: {Path(args.analysis_script).expanduser().resolve()}")
     print(f"Base directory: {base_directory}")
-    print(f"Output directory: {Path(args.output_dir).expanduser().resolve()}")
+    print(f"Output directory: {output_dir}")
     print(f"Catalog key: {args.catalog_key}")
     print(f"Slurm: {slurm}")
     for item in plan:
@@ -380,12 +388,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--profile", default="delta", help="research_paths profile to use in generated commands.")
     parser.add_argument("--base-directory", type=Path, help="Hyrax runs base directory. Defaults to research_paths.")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--output-dir", type=Path, help="Defaults to <base-directory>/static_umap_metrics.")
     parser.add_argument("--analysis-script", type=Path, default=DEFAULT_ANALYSIS_SCRIPT)
     parser.add_argument("--python-executable", default="python")
     parser.add_argument("--job-prefix", default="plot_metrics")
 
-    parser.add_argument("--catalog-key", default="raw_merger_flags")
+    parser.add_argument("--catalog-key", default=DEFAULT_CATALOG_KEY)
     parser.add_argument("--catalog-path", type=Path)
     parser.add_argument("--catalog-id-column")
     parser.add_argument("--id-field", default="objectId_data")
@@ -408,7 +416,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--suppress-logs", action=argparse.BooleanOptionalAction, default=True)
 
     parser.add_argument("--slurm", action="append", help="Override a Slurm directive, e.g. partition=cpu. Repeat as needed.")
-    parser.add_argument("--shell-preamble", action="append", help="Shell line before setup. Defaults to set -euo pipefail.")
+    parser.add_argument("--shell-preamble", action="append", help="Shell line before setup. Defaults to no extra preamble.")
     parser.add_argument("--setup-line", action="append", help="Setup line in the Slurm script. Repeat for multiple lines.")
     parser.add_argument("--no-default-setup", action="store_true", help="Do not include commented default setup lines.")
     parser.add_argument("--pause-after-first-seconds", type=int, default=10)

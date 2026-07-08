@@ -33,7 +33,7 @@ HDBSCAN = None
 
 DEFAULT_N_PERMUTATIONS = 500
 DEFAULT_MIN_CLUSTER_SIZE = 15
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "results" / "static_umap_metrics"
+DEFAULT_CATALOG_KEY = "all"
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,6 @@ class PathContext:
     project_root: Path
     hyrax_run_base: Path
     sample_catalog_paths: dict[str, Path]
-    xcatalog_paths: dict[str, Path]
 
 
 def init_science_stack() -> None:
@@ -123,54 +122,25 @@ def load_path_context(
     project_root = Path(__file__).resolve().parent
     run_base = Path(hyrax_run_base or paths.hyrax_runs).expanduser()
 
+    time_since_all_catalog = first_existing_path(
+        [
+            profile_path(
+                paths,
+                "catalog_time_since_merger_all",
+                "/work/hdd/bemi/dmiura/data_downloads/tng100_snap72/split_images/catalog2.fits",
+            ),
+            paths.catalog("raw_merger_flags"),
+            paths.catalog("all"),
+        ]
+    )
+
     sample_catalog_paths = {
-        "all": paths.catalog("all"),
+        # Match static_umap_plotting_time_since_merger_by_type.ipynb:
+        # "all" means the full sample catalog with appended merger fields.
+        "all": time_since_all_catalog,
         "raw_merger_flags": paths.catalog("raw_merger_flags"),
         "le_120x120": paths.catalog("le_120x120"),
         "gt_120x120": paths.catalog("gt_120x120"),
-    }
-
-    xcatalog_paths = {
-        "rubin_euclid_vissyn": first_existing_path(
-            [
-                profile_path(
-                    paths,
-                    "xmatch_catalog_rubin_euclid_vissyn",
-                    project_root / "data" / "xmatched_cats" / "rubin_euclid_vissyn.parquet",
-                ),
-                "/mmfs1/gscratch/escience/aritrag/comcam_dp1/external_catalogs/xmatched_cats/rubin_euclid_vissyn.parquet",
-            ]
-        ),
-        "gzoo_decals": first_existing_path(
-            [
-                profile_path(
-                    paths,
-                    "xmatch_catalog_gzoo_decals",
-                    project_root / "data" / "xmatched_cats" / "rubin_gzoo_decals_spatial.parquet",
-                ),
-                "/mmfs1/gscratch/escience/aritrag/comcam_dp1/external_catalogs/xmatched_cats/rubin_gzoo_decals_spatial.parquet",
-            ]
-        ),
-        "euclid_lens": first_existing_path(
-            [
-                profile_path(
-                    paths,
-                    "xmatch_catalog_euclid_lens",
-                    project_root / "data" / "xmatched_cats" / "rubin_euclid_lens_spatial.parquet",
-                ),
-                "/mmfs1/gscratch/escience/aritrag/comcam_dp1/external_catalogs/xmatched_cats/rubin_euclid_lens_spatial.parquet",
-            ]
-        ),
-        "des_lsb": first_existing_path(
-            [
-                profile_path(
-                    paths,
-                    "xmatch_catalog_des_lsb",
-                    project_root / "data" / "xmatched_cats" / "rubin_des_lsb.parquet",
-                ),
-                "/mmfs1/gscratch/escience/aritrag/comcam_dp1/external_catalogs/xmatched_cats/rubin_des_lsb.parquet",
-            ]
-        ),
     }
 
     return PathContext(
@@ -179,17 +149,14 @@ def load_path_context(
         project_root=project_root,
         hyrax_run_base=run_base,
         sample_catalog_paths=sample_catalog_paths,
-        xcatalog_paths=xcatalog_paths,
     )
 
 
 def catalog_path_status(ctx: PathContext):
-    """Show profile-managed sample catalogs and optional external xmatch catalogs."""
+    """Show profile-managed sample catalogs used by this workflow."""
     rows = []
     for name, path in ctx.sample_catalog_paths.items():
         rows.append({"source": "sample", "name": name, "path": str(path), "exists": Path(path).exists()})
-    for name, path in ctx.xcatalog_paths.items():
-        rows.append({"source": "xmatch_optional", "name": name, "path": str(path), "exists": Path(path).exists()})
     return pd.DataFrame(rows)
 
 
@@ -212,7 +179,7 @@ def load_external_catalog(catalog_path: str | Path):
     raise ValueError(f"Unsupported catalog format '{suffix}'. Use parquet, FITS, or CSV.")
 
 
-def load_sample_catalog(ctx: PathContext, name: str = "raw_merger_flags", required: bool = True):
+def load_sample_catalog(ctx: PathContext, name: str = DEFAULT_CATALOG_KEY, required: bool = True):
     """Load one of the profile-managed Hyrax/TNG sample catalogs."""
     if name not in ctx.sample_catalog_paths:
         valid = ", ".join(sorted(ctx.sample_catalog_paths))
@@ -228,28 +195,6 @@ def load_sample_catalog(ctx: PathContext, name: str = "raw_merger_flags", requir
 
     catalog = load_external_catalog(path)
     print(f"Loaded sample catalog '{name}': {len(catalog):,} rows from {path}")
-    return catalog
-
-
-def load_named_catalog(ctx: PathContext, name: str, required: bool = True):
-    """Load an optional xmatch catalog by XCATALOG_PATHS key."""
-    if name not in ctx.xcatalog_paths:
-        valid = ", ".join(sorted(ctx.xcatalog_paths))
-        raise KeyError(f"Unknown xmatch catalog '{name}'. Choose one of: {valid}")
-
-    path = ctx.xcatalog_paths[name]
-    if not path.exists():
-        message = (
-            f"Catalog '{name}' is not available at {path}. "
-            "Update path_profiles.toml, set HYRAX_PROFILE, or place a local copy there."
-        )
-        if required:
-            raise FileNotFoundError(message)
-        print(f"Skipping optional xmatch catalog: {message}")
-        return None
-
-    catalog = load_external_catalog(path)
-    print(f"Loaded xmatch catalog '{name}': {len(catalog):,} rows from {path}")
     return catalog
 
 
@@ -1263,7 +1208,8 @@ def analyze_run_experiment(args: argparse.Namespace) -> int:
                 suppress_logs=args.suppress_logs,
             )
 
-    output_dir = Path(args.output_dir).expanduser() / f"run{args.run}" / f"expt{args.expt}"
+    output_root = Path(args.output_dir).expanduser() if args.output_dir else ctx.hyrax_run_base / "static_umap_metrics"
+    output_dir = output_root / f"run{args.run}" / f"expt{args.expt}"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     all_metric_rows = []
@@ -1359,8 +1305,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--expt", type=int, help="Experiment number inside the run, e.g. 12.")
     parser.add_argument("--profile", help="Path profile to use, e.g. local or delta.")
     parser.add_argument("--base-directory", type=Path, help="Base Hyrax runs directory. Defaults to research_paths.")
-    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR, help="Directory for plots and metric tables.")
-    parser.add_argument("--catalog-key", default="raw_merger_flags", help="Profile catalog key when --catalog-path is not set.")
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Directory for plots and metric tables. Defaults to <hyrax_run_base>/static_umap_metrics.",
+    )
+    parser.add_argument(
+        "--catalog-key",
+        default=DEFAULT_CATALOG_KEY,
+        help="Profile catalog key when --catalog-path is not set. Defaults to the time-since notebook's all/catalog2.fits catalog.",
+    )
     parser.add_argument("--catalog-path", type=Path, help="Explicit catalog path. Supports parquet, FITS, CSV.")
     parser.add_argument("--catalog-id-column", help="Catalog object ID column. Auto-detected by default.")
     parser.add_argument("--id-field", default="objectId_data", help="Preferred UMAP metadata object ID field.")
