@@ -2,6 +2,7 @@ from collections.abc import Mapping
 from pathlib import Path
 import re
 
+
 def _default_hyrax_runs_dir():
   from research_paths import paths
 
