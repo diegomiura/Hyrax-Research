@@ -187,6 +187,13 @@ random label assignments with Gini greater than or equal to the observed Gini.
 as in the 2D UMAP space, when `[results].inference_dir` is available in the UMAP
 config.
 
+`--require-highdim` makes HD jobs fail loudly if high-dimensional data cannot be
+loaded, aligned to UMAP object IDs, or written into the metric table. Use it with
+`--include-highdim` for Slurm batches so missing HD inputs do not produce
+quietly 2D-only outputs. The notebook HD helper writes these jobs into separate
+`*_hd` output folders such as `static_umap_metrics_tsm_le_1p5gyr_hd` so existing
+2D sweeps are not overwritten.
+
 ## Notebook Logic Corrections
 
 The script keeps the notebook behavior but fixes or hardens several parts:

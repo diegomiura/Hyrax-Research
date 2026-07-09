@@ -1199,7 +1199,10 @@ def analyze_run_experiment(args: argparse.Namespace) -> int:
     highdim_coords = None
     if args.include_highdim:
         if inference_dir is None:
-            print(f"Run {args.run}, Expt {args.expt}: no inference_dir in config; skipping high-dimensional metrics.")
+            message = f"Run {args.run}, Expt {args.expt}: no inference_dir in config; skipping high-dimensional metrics."
+            if args.require_highdim:
+                raise ValueError(message.replace("skipping high-dimensional metrics", "cannot compute required high-dimensional metrics"))
+            print(message)
         else:
             highdim_coords = get_highdim_data(
                 config=h.config,
@@ -1207,6 +1210,8 @@ def analyze_run_experiment(args: argparse.Namespace) -> int:
                 umap_ids=umap_data["rubin_ids"],
                 suppress_logs=args.suppress_logs,
             )
+            if args.require_highdim and highdim_coords is None:
+                raise ValueError(f"Run {args.run}, Expt {args.expt}: required high-dimensional data loaded as None")
 
     output_root = Path(args.output_dir).expanduser() if args.output_dir else ctx.hyrax_run_base / "static_umap_metrics"
     output_dir = output_root / f"run{args.run}" / f"expt{args.expt}"
@@ -1260,6 +1265,20 @@ def analyze_run_experiment(args: argparse.Namespace) -> int:
             log_colorbar=args.log_colorbar,
             density_cmap=args.density_cmap,
         )
+
+    if args.require_highdim:
+        if highdim_coords is None:
+            raise ValueError(f"Run {args.run}, Expt {args.expt}: required high-dimensional metrics were not computed")
+        missing_hd = [
+            (row.get("overlay_group"), row.get("overlay_label"))
+            for row in all_metric_rows
+            if "mnln_hd_ratio" not in row or "cmc_hd_gini" not in row
+        ]
+        if missing_hd:
+            raise ValueError(
+                f"Run {args.run}, Expt {args.expt}: required high-dimensional metric columns are missing "
+                f"for overlays {missing_hd[:5]}"
+            )
 
     metrics_csv = output_dir / f"run{args.run}_expt{args.expt}_metrics.csv"
     metrics_json = output_dir / f"run{args.run}_expt{args.expt}_metrics.json"
@@ -1326,6 +1345,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cluster-size", type=positive_int, default=DEFAULT_MIN_CLUSTER_SIZE)
     parser.add_argument("--seed", type=int, default=42, help="Permutation RNG seed.")
     parser.add_argument("--include-highdim", action="store_true", help="Also compute metrics in high-dimensional latent space.")
+    parser.add_argument(
+        "--require-highdim",
+        action="store_true",
+        help="Fail instead of silently skipping when requested high-dimensional metrics cannot be computed.",
+    )
     parser.add_argument("--dpi", type=positive_int, default=150)
     parser.add_argument("--alpha-background", type=float, default=0.5)
     parser.add_argument("--s-background", type=float, default=1.0)
@@ -1341,6 +1365,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.require_highdim:
+        args.include_highdim = True
 
     if not args.list_overlays and (args.run is None or args.expt is None):
         parser.error("--run and --expt are required unless --list-overlays is used")

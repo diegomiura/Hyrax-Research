@@ -263,6 +263,8 @@ def build_analysis_command(
         command.extend(["--time-since-merger-max-gyr", str(args.time_since_merger_max_gyr)])
     if args.include_highdim:
         command.append("--include-highdim")
+    if args.require_highdim:
+        command.append("--require-highdim")
     if args.all_overlay_groups:
         command.append("--all-overlay-groups")
     else:
@@ -437,6 +439,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-cluster-size", type=positive_int, default=15)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--include-highdim", action="store_true")
+    parser.add_argument(
+        "--require-highdim",
+        action="store_true",
+        help="Pass --require-highdim to analysis jobs and fail when HD metrics cannot be computed.",
+    )
 
     parser.add_argument("--dpi", type=positive_int, default=150)
     parser.add_argument("--alpha-background", type=float, default=0.5)
@@ -459,6 +466,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.require_highdim:
+        args.include_highdim = True
 
     if args.action == "print-plan":
         print_plan(args)
