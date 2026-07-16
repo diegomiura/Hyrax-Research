@@ -726,6 +726,219 @@ def fit_hdbscan_labels(coords: Any, min_cluster_size: int = 15):
     return clusterer.fit_predict(coords)
 
 
+def _validated_boolean_mask(values: Any, length: int, name: str):
+    """Return a one-dimensional boolean mask with a helpful shape check."""
+    mask = np.asarray(values)
+    if mask.ndim != 1:
+        raise ValueError(f"{name} must be one-dimensional; got shape {mask.shape}")
+    if len(mask) != length:
+        raise ValueError(f"{name} must have length {length}; got {len(mask)}")
+    if bool(np.asarray(pd.isna(mask)).any()):
+        raise ValueError(f"{name} contains missing values")
+    return mask.astype(bool, copy=False)
+
+
+def nearest_target_distances(
+    coords: Any,
+    target_mask: Any,
+    evaluation_mask: Any = None,
+    n_neighbors: int = 1,
+):
+    """Score each evaluated point by distance to its kth nearest target.
+
+    Target anchors and queries are restricted to ``evaluation_mask``. Each
+    query is evaluated as though its own row were left out of the anchor set:
+    removing a negative query changes nothing, while a target query uses the
+    kth *other* target. Non-evaluated rows receive ``NaN`` in the returned
+    array.
+
+    Parameters
+    ----------
+    coords
+        Coordinates with one row per point. One-dimensional input is treated
+        as a single coordinate feature.
+    target_mask
+        Boolean mask identifying the positive class.
+    evaluation_mask
+        Optional boolean mask defining the evaluation population. Defaults to
+        all rows.
+    n_neighbors
+        Rank of the target neighbor to use (1 means nearest target).
+
+    Returns
+    -------
+    numpy.ndarray
+        One distance per input row, with ``NaN`` outside the evaluation set.
+    """
+    from sklearn.neighbors import NearestNeighbors
+
+    coords = _as_2d_numeric_array(coords)
+    n_points = len(coords)
+    target_mask = _validated_boolean_mask(target_mask, n_points, "target_mask")
+    if evaluation_mask is None:
+        evaluation_mask = np.ones(n_points, dtype=bool)
+    else:
+        evaluation_mask = _validated_boolean_mask(evaluation_mask, n_points, "evaluation_mask")
+
+    if isinstance(n_neighbors, (bool, np.bool_)) or not isinstance(n_neighbors, (int, np.integer)):
+        raise TypeError("n_neighbors must be a positive integer")
+    n_neighbors = int(n_neighbors)
+    if n_neighbors < 1:
+        raise ValueError("n_neighbors must be at least 1")
+
+    query_indices = np.flatnonzero(evaluation_mask)
+    if len(query_indices) == 0:
+        raise ValueError("evaluation_mask does not select any points")
+
+    anchor_indices = np.flatnonzero(evaluation_mask & target_mask)
+    # Positive queries must exclude themselves, so kth-other distances need
+    # at least k + 1 evaluated target anchors.
+    if len(anchor_indices) <= n_neighbors:
+        raise ValueError(
+            "nearest-target scoring needs at least n_neighbors + 1 evaluated "
+            f"targets; got {len(anchor_indices)} targets for n_neighbors={n_neighbors}"
+        )
+
+    neighbors = NearestNeighbors(n_neighbors=n_neighbors + 1, metric="euclidean")
+    neighbors.fit(coords[anchor_indices])
+    neighbor_distances, neighbor_positions = neighbors.kneighbors(
+        coords[query_indices], return_distance=True
+    )
+    neighbor_indices = anchor_indices[neighbor_positions]
+
+    distances = np.full(n_points, np.nan, dtype=float)
+    for row, query_index in enumerate(query_indices):
+        row_distances = neighbor_distances[row]
+        if target_mask[query_index]:
+            # Exclude by row identity rather than dropping the first zero:
+            # distinct target rows are allowed to have identical coordinates.
+            other = neighbor_indices[row] != query_index
+            row_distances = row_distances[other]
+        distances[query_index] = row_distances[n_neighbors - 1]
+
+    return distances
+
+
+def distance_completeness_purity_curve(
+    distances: Any,
+    target_mask: Any,
+    evaluation_mask: Any = None,
+):
+    """Build a completeness-purity curve by sweeping distance thresholds.
+
+    A point is selected when its finite score is less than or equal to the
+    current threshold. Rows with equal distances enter together, making tie
+    handling deterministic and independent of input order. Completeness is the
+    selected target count divided by *all* evaluated targets; purity is the
+    selected target count divided by all selected evaluated points. The first
+    row is the empty selection, conventionally assigned completeness 0 and
+    purity 1.
+
+    Returns
+    -------
+    tuple[pandas.DataFrame, dict]
+        The threshold curve and a compact summary containing prevalence, an
+        AP-like step area, the maximum F1 operating point, and coverage counts.
+    """
+    distances = np.asarray(distances, dtype=float)
+    if distances.ndim != 1:
+        raise ValueError(f"distances must be one-dimensional; got shape {distances.shape}")
+    if len(distances) == 0:
+        raise ValueError("distances is empty")
+
+    n_points = len(distances)
+    target_mask = _validated_boolean_mask(target_mask, n_points, "target_mask")
+    if evaluation_mask is None:
+        evaluation_mask = np.ones(n_points, dtype=bool)
+    else:
+        evaluation_mask = _validated_boolean_mask(evaluation_mask, n_points, "evaluation_mask")
+
+    n_evaluated = int(evaluation_mask.sum())
+    if n_evaluated == 0:
+        raise ValueError("evaluation_mask does not select any points")
+    n_targets = int(np.sum(evaluation_mask & target_mask))
+    if n_targets == 0:
+        raise ValueError("target_mask does not select any evaluated targets")
+
+    finite_mask = evaluation_mask & np.isfinite(distances)
+    if np.any(distances[finite_mask] < 0):
+        raise ValueError("finite distances must be non-negative")
+
+    rows = [
+        {
+            "distance_threshold": -np.inf,
+            "n_selected": 0,
+            "true_positives": 0,
+            "false_positives": 0,
+            "false_negatives": n_targets,
+            "completeness": 0.0,
+            "purity": 1.0,
+            "f1": 0.0,
+            # Purity is conventionally 1 at the empty-selection origin, but
+            # its lift is undefined because no objects were selected.
+            "lift": np.nan,
+        }
+    ]
+
+    if finite_mask.any():
+        grouped = (
+            pd.DataFrame(
+                {
+                    "distance_threshold": distances[finite_mask],
+                    "is_target": target_mask[finite_mask].astype(int),
+                }
+            )
+            .groupby("distance_threshold", sort=True, as_index=False)
+            .agg(group_size=("is_target", "size"), group_targets=("is_target", "sum"))
+        )
+
+        n_selected = 0
+        true_positives = 0
+        for group in grouped.itertuples(index=False):
+            n_selected += int(group.group_size)
+            true_positives += int(group.group_targets)
+            completeness = true_positives / n_targets
+            purity = true_positives / n_selected
+            f1 = 2.0 * completeness * purity / (completeness + purity) if true_positives else 0.0
+            rows.append(
+                {
+                    "distance_threshold": float(group.distance_threshold),
+                    "n_selected": n_selected,
+                    "true_positives": true_positives,
+                    "false_positives": n_selected - true_positives,
+                    "false_negatives": n_targets - true_positives,
+                    "completeness": float(completeness),
+                    "purity": float(purity),
+                    "f1": float(f1),
+                    "lift": float(purity / (n_targets / n_evaluated)),
+                }
+            )
+
+    curve = pd.DataFrame(rows)
+    completeness_gain = curve["completeness"].diff().fillna(curve["completeness"])
+    step_area = float(np.sum(completeness_gain * curve["purity"]))
+    best_index = int(curve["f1"].to_numpy().argmax())
+    best = curve.iloc[best_index]
+
+    prevalence = float(n_targets / n_evaluated)
+    summary = {
+        "n_evaluated": n_evaluated,
+        "n_scored": int(finite_mask.sum()),
+        "n_unscored": int(n_evaluated - finite_mask.sum()),
+        "n_targets": n_targets,
+        "prevalence": prevalence,
+        "target_neighbor_rank": None,
+        "average_precision": step_area,
+        "ap_lift": float(step_area / prevalence),
+        "best_f1": float(best["f1"]),
+        "best_distance_threshold": float(best["distance_threshold"]),
+        "best_completeness": float(best["completeness"]),
+        "best_purity": float(best["purity"]),
+        "best_n_selected": int(best["n_selected"]),
+    }
+    return curve, summary
+
+
 def cmc_gini_from_labels(cluster_labels: Any, labeled_mask: Any, n_permutations: int = 500, seed: int = 42) -> dict[str, Any]:
     """Cluster Membership Concentration via Gini coefficient."""
     cluster_labels = np.asarray(cluster_labels)
@@ -800,6 +1013,106 @@ def cmc_gini_from_labels(cluster_labels: Any, labeled_mask: Any, n_permutations:
     }
 
 
+def catalog_matched_mask(
+    umap_data: Mapping[str, Any],
+    catalog: Any,
+    catalog_id_column: str | None = None,
+):
+    """Return the UMAP rows whose normalized IDs occur in ``catalog``.
+
+    Catalog IDs are normalized and deduplicated before matching, so repeated
+    catalog rows cannot change the boolean result. Missing IDs never match.
+    """
+    if catalog is None:
+        raise ValueError("A catalog DataFrame is required to match UMAP IDs.")
+    if "rubin_ids" not in umap_data:
+        raise KeyError("umap_data must contain a 'rubin_ids' array")
+
+    umap_ids = np.asarray(umap_data["rubin_ids"])
+    if umap_ids.ndim != 1:
+        raise ValueError(f"umap_data['rubin_ids'] must be one-dimensional; got shape {umap_ids.shape}")
+    if len(umap_ids) == 0:
+        raise ValueError("umap_data['rubin_ids'] is empty")
+
+    catalog_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
+    unique_catalog_ids = (
+        normalize_object_ids(catalog[catalog_id_column]).dropna().drop_duplicates()
+    )
+    normalized_umap_ids = normalize_object_ids(umap_ids)
+    duplicated_umap_ids = normalized_umap_ids.dropna().duplicated(keep=False)
+    if duplicated_umap_ids.any():
+        duplicates = normalized_umap_ids.dropna()[duplicated_umap_ids].drop_duplicates().head().tolist()
+        raise ValueError(
+            "UMAP object IDs must be unique for object-level completeness and purity. "
+            f"First duplicate IDs: {duplicates}"
+        )
+    return normalized_umap_ids.isin(unique_catalog_ids).to_numpy(dtype=bool)
+
+
+def overlay_evaluation_mask(
+    umap_data: Mapping[str, Any],
+    catalog: Any,
+    overlay: Mapping[str, Any],
+    catalog_id_column: str | None = None,
+):
+    """Return UMAP rows with a known, internally consistent overlay label.
+
+    Overlay columns are numeric in the supported catalog schemas. Missing and
+    non-finite values mean the binary target label is unknown, so those objects
+    are excluded from completeness and purity denominators. Finite sentinels
+    such as ``-1`` remain valid known negatives for range selections that start
+    at zero. Repeated catalog rows are collapsed by normalized object ID; an ID
+    whose known rows disagree on target membership raises instead of being
+    silently resolved as positive or negative.
+    """
+    if catalog is None:
+        raise ValueError("A catalog DataFrame is required to build an overlay evaluation mask.")
+    if not isinstance(overlay, Mapping):
+        raise TypeError("overlay must be a mapping specification")
+
+    catalog_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
+    key = overlay.get("key")
+    if key is None:
+        return catalog_matched_mask(
+            umap_data,
+            catalog,
+            catalog_id_column=catalog_id_column,
+        )
+    if key not in catalog.columns:
+        raise KeyError(f"Catalog column '{key}' not found. Available columns include: {list(catalog.columns[:20])}")
+
+    labels = pd.DataFrame(
+        {
+            "_match_id": normalize_object_ids(catalog[catalog_id_column]),
+            "_value": pd.to_numeric(catalog[key], errors="coerce"),
+            "_is_target": _overlay_row_mask(catalog, overlay).fillna(False).to_numpy(dtype=bool),
+        }
+    )
+    known = labels[
+        labels["_match_id"].notna()
+        & labels["_value"].notna()
+        & np.isfinite(labels["_value"])
+    ][["_match_id", "_is_target"]].drop_duplicates()
+
+    if not known.empty:
+        membership_counts = known.groupby("_match_id", sort=False)["_is_target"].nunique()
+        conflicts = membership_counts[membership_counts > 1].index.tolist()
+        if conflicts:
+            raise ValueError(
+                "Repeated catalog rows disagree on overlay target membership for "
+                f"{len(conflicts)} object IDs. First conflicts: {conflicts[:5]}"
+            )
+
+    known_catalog = pd.DataFrame(
+        {catalog_id_column: known["_match_id"].drop_duplicates()}
+    )
+    return catalog_matched_mask(
+        umap_data,
+        known_catalog,
+        catalog_id_column=catalog_id_column,
+    )
+
+
 def overlay_labeled_mask(umap_data: Mapping[str, Any], catalog: Any, overlay: Mapping[str, Any], catalog_id_column: str | None = None):
     """Build a boolean mask over UMAP points for one overlay selection."""
     catalog_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
@@ -811,6 +1124,80 @@ def overlay_labeled_mask(umap_data: Mapping[str, Any], catalog: Any, overlay: Ma
     selected_ids = set(normalize_object_ids(selected[catalog_id_column]).dropna().drop_duplicates())
     umap_ids = normalize_object_ids(umap_data["rubin_ids"])
     return umap_ids.isin(selected_ids).to_numpy(dtype=bool)
+
+
+def compute_overlay_completeness_purity(
+    umap_data: Mapping[str, Any],
+    catalog: Any,
+    overlay: Mapping[str, Any],
+    n_neighbors: int = 1,
+    catalog_id_column: str | None = None,
+) -> dict[str, Any]:
+    """Compute a nearest-target completeness-purity analysis for one overlay.
+
+    Only UMAP points with a unique ID match and a finite value for the overlay
+    field are evaluated. The target class is defined by ``overlay`` using the
+    same selection rules as plotting and the other overlay metrics. Each point
+    receives a leave-one-out score; for positive points this prevents the
+    trivial zero self-distance from inflating purity.
+
+    The returned dictionary contains ``curve``, ``summary``, ``distances``,
+    ``target_mask``, ``evaluation_mask``, and the resolved
+    ``catalog_id_column``.
+    """
+    if catalog is None:
+        raise ValueError("A catalog DataFrame is required for completeness-purity analysis.")
+    if not isinstance(overlay, Mapping):
+        raise TypeError("overlay must be a mapping specification")
+    for coordinate in ("x", "y", "rubin_ids"):
+        if coordinate not in umap_data:
+            raise KeyError(f"umap_data must contain a '{coordinate}' array")
+
+    resolved_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
+    coords = _as_2d_numeric_array(
+        np.column_stack([umap_data["x"], umap_data["y"]]),
+        name="UMAP coordinates",
+    )
+    if len(umap_data["rubin_ids"]) != len(coords):
+        raise ValueError(
+            "UMAP coordinates and rubin_ids must have the same length: "
+            f"{len(coords)} vs {len(umap_data['rubin_ids'])}"
+        )
+
+    evaluation_mask = overlay_evaluation_mask(
+        umap_data,
+        catalog,
+        overlay,
+        catalog_id_column=resolved_id_column,
+    )
+    target_mask = overlay_labeled_mask(
+        umap_data,
+        catalog,
+        overlay,
+        catalog_id_column=resolved_id_column,
+    )
+    distances = nearest_target_distances(
+        coords,
+        target_mask,
+        evaluation_mask=evaluation_mask,
+        n_neighbors=n_neighbors,
+    )
+    curve, summary = distance_completeness_purity_curve(
+        distances,
+        target_mask,
+        evaluation_mask=evaluation_mask,
+    )
+    summary["target_neighbor_rank"] = int(n_neighbors)
+    summary["evaluation_scheme"] = "leave_one_out_target_anchor"
+
+    return {
+        "curve": curve,
+        "summary": summary,
+        "distances": distances,
+        "target_mask": target_mask,
+        "evaluation_mask": evaluation_mask,
+        "catalog_id_column": resolved_id_column,
+    }
 
 
 def compute_overlay_metrics(
