@@ -172,6 +172,16 @@ class UmapRun:
         }
 
 
+@dataclass
+class SelectionEvaluation:
+    """In-memory completeness-purity result for one named UMAP selection."""
+
+    selection_name: str
+    run: UmapRun
+    summary: Any
+    selected_objects: Any
+
+
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
         import tomllib
@@ -1220,18 +1230,225 @@ def open_visualizer(run: UmapRun, *, display_images: bool = False, **plot_option
     return pane, visualizer
 
 
+def _selection_metadata(run: UmapRun, selection_name: str) -> dict[str, Any]:
+    return {
+        "selection_name": selection_name,
+        "run": run.artifact.ref.run,
+        "expt": run.artifact.ref.expt,
+        "umap_label": run.label,
+        "result_dir": str(run.result_dir),
+        "n_neighbors": run.params.n_neighbors,
+        "min_dist": run.params.min_dist,
+        "metric": run.params.metric,
+        "seed": run.seed,
+        "historical": run.historical,
+    }
+
+
+def _prepend_metadata(frame: Any, metadata: Mapping[str, Any]):
+    result = frame.copy()
+    for column, value in reversed(tuple(metadata.items())):
+        result.insert(0, column, value)
+    return result
+
+
+def evaluate_visualizer_selection(
+    run: UmapRun,
+    visualizer: Any,
+    catalog: Any,
+    overlays: Sequence[Mapping[str, Any]],
+    *,
+    selection_name: str,
+    catalog_id_column: str | None = None,
+) -> SelectionEvaluation:
+    """Score the current ``get_selected_df`` result for one UMAP run.
+
+    The returned summary has one row per overlay target. Selected objects are
+    represented in long form so their known-label and target membership can be
+    inspected for every target rule without mutating or saving notebook state.
+    """
+    import pandas as pd
+
+    import static_umap_metrics as metrics
+
+    selection_name = str(selection_name).strip()
+    if not selection_name:
+        raise ValueError("selection_name must be a non-empty string")
+    if not isinstance(run, UmapRun):
+        raise TypeError("run must be a UmapRun")
+    if not hasattr(visualizer, "get_selected_df"):
+        raise TypeError("visualizer must provide get_selected_df()")
+
+    selected_df = visualizer.get_selected_df()
+    if not isinstance(selected_df, pd.DataFrame):
+        raise TypeError("visualizer.get_selected_df() must return a pandas DataFrame")
+
+    selected_id_column = getattr(visualizer, "object_id_column_name", None)
+    id_candidates = [
+        selected_id_column,
+        "object_id",
+        "rubin_object_id",
+        "objectId",
+        "objectId_data",
+        "id",
+    ]
+    selected_id_column = next(
+        (candidate for candidate in id_candidates if candidate and candidate in selected_df.columns),
+        None,
+    )
+    if selected_id_column is None:
+        raise KeyError(
+            "Could not find the visualizer object-ID column in get_selected_df() output"
+        )
+
+    umap_ids, _ = load_embedding_arrays(run.result_dir)
+    score = metrics.compute_selection_completeness_purity(
+        umap_ids,
+        selected_df[selected_id_column].to_numpy(),
+        catalog,
+        overlays,
+        catalog_id_column=catalog_id_column,
+    )
+
+    selected_rows = selected_df.reset_index(drop=True).copy()
+    selected_rows["_match_id"] = metrics.normalize_object_ids(
+        selected_rows[selected_id_column]
+    ).to_numpy()
+    duplicated_selection_ids = selected_rows["_match_id"].duplicated(keep=False)
+    if duplicated_selection_ids.any():
+        duplicates = (
+            selected_rows.loc[duplicated_selection_ids, "_match_id"]
+            .drop_duplicates()
+            .head()
+            .tolist()
+        )
+        raise ValueError(
+            "get_selected_df() returned duplicate object IDs. "
+            f"First duplicates: {duplicates}"
+        )
+
+    membership = score["selected_membership"].drop(columns=["object_id"])
+    selected_objects = selected_rows.merge(
+        membership,
+        on="_match_id",
+        how="inner",
+        validate="one_to_many",
+    ).drop(columns=["_match_id"])
+
+    metadata = _selection_metadata(run, selection_name)
+    summary = _prepend_metadata(score["summary"], metadata)
+    selected_objects = _prepend_metadata(selected_objects, metadata)
+    return SelectionEvaluation(
+        selection_name=selection_name,
+        run=run,
+        summary=summary,
+        selected_objects=selected_objects,
+    )
+
+
+def selection_results_table(evaluations: Iterable[SelectionEvaluation]):
+    """Concatenate named selection summaries into one comparison table."""
+    import pandas as pd
+
+    evaluations = list(evaluations)
+    if any(not isinstance(evaluation, SelectionEvaluation) for evaluation in evaluations):
+        raise TypeError("evaluations must contain only SelectionEvaluation instances")
+    if not evaluations:
+        return pd.DataFrame()
+    return pd.concat(
+        [evaluation.summary for evaluation in evaluations],
+        ignore_index=True,
+        sort=False,
+    )
+
+
+def plot_selection_results(
+    evaluations: Iterable[SelectionEvaluation],
+    *,
+    ncols: int = 3,
+    figsize: tuple[float, float] | None = None,
+):
+    """Plot named manual selections in faceted completeness-purity space."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    table = selection_results_table(evaluations)
+    if table.empty:
+        raise ValueError("At least one SelectionEvaluation is required for plotting")
+    if isinstance(ncols, bool) or not isinstance(ncols, int) or ncols < 1:
+        raise ValueError("ncols must be a positive integer")
+
+    target_labels = list(dict.fromkeys(table["target_label"].tolist()))
+    ncols = min(ncols, len(target_labels))
+    nrows = math.ceil(len(target_labels) / ncols)
+    if figsize is None:
+        figsize = (5.0 * ncols, 4.2 * nrows)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=figsize, squeeze=False)
+    selection_names = list(dict.fromkeys(table["selection_name"].tolist()))
+    cmap = plt.get_cmap("tab10")
+    selection_colors = {
+        name: cmap(index % 10) for index, name in enumerate(selection_names)
+    }
+
+    for ax, target_label in zip(axes.flat, target_labels, strict=False):
+        target_rows = table.loc[table["target_label"] == target_label]
+        plotted = 0
+        for row in target_rows.itertuples(index=False):
+            if not np.isfinite(row.completeness) or not np.isfinite(row.purity):
+                continue
+            ax.scatter(
+                row.completeness,
+                row.purity,
+                color=selection_colors[row.selection_name],
+                s=55,
+                zorder=3,
+            )
+            ax.annotate(
+                row.selection_name,
+                (row.completeness, row.purity),
+                xytext=(5, 5),
+                textcoords="offset points",
+                fontsize=8,
+            )
+            plotted += 1
+
+        if not plotted:
+            ax.text(
+                0.5,
+                0.5,
+                "No selection with known labels",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+        ax.set_title(str(target_label))
+        ax.set_xlabel("Completeness")
+        ax.set_ylabel("Purity")
+        ax.set_xlim(0.0, 1.0)
+        ax.set_ylim(0.0, 1.0)
+        ax.grid(alpha=0.25)
+
+    for ax in list(axes.flat)[len(target_labels) :]:
+        ax.set_visible(False)
+    fig.tight_layout()
+    return fig, axes
+
+
 __all__ = [
     "ArtifactDiscoveryError",
     "ExperimentArtifacts",
     "ExperimentRef",
     "ExplorationError",
     "ParameterValidationError",
+    "SelectionEvaluation",
     "UmapParams",
     "UmapRun",
     "artifacts_table",
     "diagnose_runs",
     "discover_experiment",
     "ensure_controls",
+    "evaluate_visualizer_selection",
     "fixed_sample_indices",
     "historical_runs",
     "load_embedding_arrays",
@@ -1239,11 +1456,13 @@ __all__ = [
     "manifest_table",
     "open_visualizer",
     "plot_grid",
+    "plot_selection_results",
     "preflight",
     "projection_diagnostics",
     "rebuild_manifest",
     "run_all",
     "run_selected",
     "runs_table",
+    "selection_results_table",
     "session_directory",
 ]

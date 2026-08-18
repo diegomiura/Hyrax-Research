@@ -45,11 +45,26 @@ class PathContext:
     sample_catalog_paths: dict[str, Path]
 
 
-def init_science_stack() -> None:
-    """Import scientific dependencies only when the analysis actually runs."""
-    global np, pd, plt, LogNorm, HDBSCAN
-    if np is not None:
+def init_tabular_stack() -> None:
+    """Import NumPy and pandas without changing the active plotting backend."""
+    global np, pd
+    if np is not None and pd is not None:
         return
+
+    import numpy as _np
+    import pandas as _pd
+
+    np = _np
+    pd = _pd
+
+
+def init_science_stack() -> None:
+    """Import all batch-analysis dependencies only when the analysis runs."""
+    global plt, LogNorm, HDBSCAN
+    if plt is not None and LogNorm is not None and HDBSCAN is not None:
+        return
+
+    init_tabular_stack()
 
     os.environ.setdefault(
         "MPLCONFIGDIR",
@@ -60,8 +75,6 @@ def init_science_stack() -> None:
         str(Path(os.environ.get("TMPDIR", "/tmp")) / f"numba-{os.environ.get('SLURM_JOB_ID', 'manual')}"),
     )
 
-    import numpy as _np
-    import pandas as _pd
     import matplotlib
 
     matplotlib.use("Agg")
@@ -73,8 +86,6 @@ def init_science_stack() -> None:
     except ImportError:
         from hdbscan import HDBSCAN as _HDBSCAN
 
-    np = _np
-    pd = _pd
     plt = _plt
     LogNorm = _LogNorm
     HDBSCAN = _HDBSCAN
@@ -1124,6 +1135,229 @@ def overlay_labeled_mask(umap_data: Mapping[str, Any], catalog: Any, overlay: Ma
     selected_ids = set(normalize_object_ids(selected[catalog_id_column]).dropna().drop_duplicates())
     umap_ids = normalize_object_ids(umap_data["rubin_ids"])
     return umap_ids.isin(selected_ids).to_numpy(dtype=bool)
+
+
+def compute_selection_completeness_purity(
+    umap_ids: Any,
+    selected_ids: Any,
+    catalog: Any,
+    overlays: Sequence[Mapping[str, Any]],
+    catalog_id_column: str | None = None,
+) -> dict[str, Any]:
+    """Score a manual UMAP selection against one or more catalog targets.
+
+    Each overlay defines a binary target class using the same rules as the
+    static UMAP plotting and nearest-target completeness-purity workflows.
+    Objects with an absent, missing, or non-finite catalog label are excluded
+    from the metric denominators and reported as unknown selected objects.
+
+    Parameters
+    ----------
+    umap_ids
+        Unique object IDs for the full UMAP evaluation population.
+    selected_ids
+        Object IDs inside the current manual selection. Repeated IDs are
+        collapsed because selection membership is object-level.
+    catalog
+        Catalog containing object IDs and the overlay target columns.
+    overlays
+        Non-empty sequence of overlay rule mappings. Each rule must have a
+        unique display label, or a unique ``key`` when ``label`` is omitted.
+    catalog_id_column
+        Optional catalog object-ID column. When omitted, use the standard
+        catalog ID-column resolution rules.
+
+    Returns
+    -------
+    dict
+        ``summary`` is a DataFrame with one completeness-purity result per
+        overlay. ``selected_membership`` is a long-form DataFrame describing
+        whether each selected object has a known label and is a target for
+        each overlay. ``selection_mask`` is aligned to ``umap_ids``.
+    """
+    init_tabular_stack()
+
+    if catalog is None:
+        raise ValueError("A catalog DataFrame is required for selection scoring.")
+    if isinstance(overlays, (str, bytes, Mapping)) or not isinstance(overlays, Sequence):
+        raise TypeError("overlays must be a non-empty sequence of mapping specifications")
+    if not overlays:
+        raise ValueError("overlays must contain at least one target rule")
+    if any(not isinstance(overlay, Mapping) for overlay in overlays):
+        raise TypeError("every overlay must be a mapping specification")
+
+    umap_ids_array = np.asarray(umap_ids)
+    if umap_ids_array.ndim != 1:
+        raise ValueError(f"umap_ids must be one-dimensional; got shape {umap_ids_array.shape}")
+    if len(umap_ids_array) == 0:
+        raise ValueError("umap_ids is empty")
+
+    normalized_umap_ids = normalize_object_ids(umap_ids_array)
+    if normalized_umap_ids.isna().any():
+        raise ValueError("umap_ids contains missing object IDs")
+    duplicated_umap_ids = normalized_umap_ids.duplicated(keep=False)
+    if duplicated_umap_ids.any():
+        duplicates = normalized_umap_ids[duplicated_umap_ids].drop_duplicates().head().tolist()
+        raise ValueError(
+            "UMAP object IDs must be unique for object-level completeness and purity. "
+            f"First duplicate IDs: {duplicates}"
+        )
+
+    selected_ids_array = np.asarray(selected_ids)
+    if selected_ids_array.ndim != 1:
+        raise ValueError(
+            f"selected_ids must be one-dimensional; got shape {selected_ids_array.shape}"
+        )
+    normalized_selected_ids = normalize_object_ids(selected_ids_array)
+    if normalized_selected_ids.isna().any():
+        raise ValueError("selected_ids contains missing object IDs")
+    normalized_selected_ids = normalized_selected_ids.drop_duplicates()
+
+    umap_id_set = set(normalized_umap_ids.tolist())
+    missing_selected_ids = [
+        object_id
+        for object_id in normalized_selected_ids.tolist()
+        if object_id not in umap_id_set
+    ]
+    if missing_selected_ids:
+        raise ValueError(
+            f"{len(missing_selected_ids)} selected object IDs are absent from the UMAP. "
+            f"First missing IDs: {missing_selected_ids[:5]}"
+        )
+
+    selection_mask = normalized_umap_ids.isin(normalized_selected_ids).to_numpy(dtype=bool)
+    selected_indices = np.flatnonzero(selection_mask)
+    n_selected = int(selection_mask.sum())
+    umap_data = {"rubin_ids": umap_ids_array}
+    resolved_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
+
+    target_labels = [
+        str(overlay.get("label") or overlay.get("key") or f"overlay_{index + 1}")
+        for index, overlay in enumerate(overlays)
+    ]
+    duplicated_labels = pd.Series(target_labels)[pd.Series(target_labels).duplicated()].unique()
+    if len(duplicated_labels):
+        raise ValueError(
+            "Overlay labels must be unique for comparison and plotting. "
+            f"Duplicates: {duplicated_labels.tolist()}"
+        )
+
+    summary_rows = []
+    membership_frames = []
+    for target_label, overlay in zip(target_labels, overlays, strict=True):
+        evaluation_mask = overlay_evaluation_mask(
+            umap_data,
+            catalog,
+            overlay,
+            catalog_id_column=resolved_id_column,
+        )
+        target_mask = overlay_labeled_mask(
+            umap_data,
+            catalog,
+            overlay,
+            catalog_id_column=resolved_id_column,
+        )
+        target_mask &= evaluation_mask
+
+        n_evaluated = int(evaluation_mask.sum())
+        if n_evaluated == 0:
+            raise ValueError(f"Overlay '{target_label}' has no evaluated UMAP objects")
+        n_targets = int(target_mask.sum())
+        if n_targets == 0:
+            raise ValueError(f"Overlay '{target_label}' has no evaluated target objects")
+
+        selected_evaluation_mask = selection_mask & evaluation_mask
+        n_selected_evaluated = int(selected_evaluation_mask.sum())
+        n_selected_unknown = n_selected - n_selected_evaluated
+        true_positives = int(np.sum(selection_mask & target_mask))
+        false_positives = n_selected_evaluated - true_positives
+        false_negatives = n_targets - true_positives
+        true_negatives = n_evaluated - true_positives - false_positives - false_negatives
+
+        completeness = float(true_positives / n_targets)
+        if n_selected == 0:
+            purity = 1.0
+            f1 = 0.0
+            lift = np.nan
+        elif n_selected_evaluated == 0:
+            purity = np.nan
+            f1 = np.nan
+            lift = np.nan
+        else:
+            purity = float(true_positives / n_selected_evaluated)
+            denominator = completeness + purity
+            f1 = float(2.0 * completeness * purity / denominator) if denominator else 0.0
+            lift = float(purity / (n_targets / n_evaluated))
+
+        is_range_rule = "min_value" in overlay or "max_value" in overlay
+        summary_rows.append(
+            {
+                "target_label": target_label,
+                "target_key": overlay.get("key"),
+                "target_comparator": (
+                    None if is_range_rule else overlay.get("comparator", ">=")
+                ),
+                "target_threshold": (
+                    None if is_range_rule else overlay.get("threshold", 0.0)
+                ),
+                "target_min_value": overlay.get("min_value"),
+                "target_max_value": overlay.get("max_value"),
+                "n_umap": len(umap_ids_array),
+                "n_evaluated": n_evaluated,
+                "n_targets": n_targets,
+                "prevalence": float(n_targets / n_evaluated),
+                "n_selected": n_selected,
+                "n_selected_evaluated": n_selected_evaluated,
+                "n_selected_unknown": n_selected_unknown,
+                "selected_label_coverage": (
+                    float(n_selected_evaluated / n_selected) if n_selected else np.nan
+                ),
+                "true_positives": true_positives,
+                "false_positives": false_positives,
+                "false_negatives": false_negatives,
+                "true_negatives": true_negatives,
+                "completeness": completeness,
+                "purity": purity,
+                "f1": f1,
+                "lift": lift,
+            }
+        )
+
+        membership_frames.append(
+            pd.DataFrame(
+                {
+                    "umap_index": selected_indices,
+                    "object_id": umap_ids_array[selected_indices],
+                    "_match_id": normalized_umap_ids.iloc[selected_indices].to_numpy(),
+                    "target_label": target_label,
+                    "target_key": overlay.get("key"),
+                    "is_known_label": evaluation_mask[selected_indices],
+                    "is_target": target_mask[selected_indices],
+                }
+            )
+        )
+
+    membership_columns = [
+        "umap_index",
+        "object_id",
+        "_match_id",
+        "target_label",
+        "target_key",
+        "is_known_label",
+        "is_target",
+    ]
+    selected_membership = (
+        pd.concat(membership_frames, ignore_index=True)
+        if membership_frames
+        else pd.DataFrame(columns=membership_columns)
+    )
+
+    return {
+        "summary": pd.DataFrame(summary_rows),
+        "selected_membership": selected_membership.reindex(columns=membership_columns),
+        "selection_mask": selection_mask,
+        "catalog_id_column": resolved_id_column,
+    }
 
 
 def compute_overlay_completeness_purity(
