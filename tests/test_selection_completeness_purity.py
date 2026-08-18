@@ -249,6 +249,23 @@ class _MockVisualizer:
         )
 
 
+class _MetadataFreeVisualizer:
+    object_id_column_name = "object_id"
+    data_fields: list[str] = []
+    points_id = np.array(["1", "2", "5", "7"])
+    points = np.array(
+        [
+            [0.0, 0.0],
+            [1.0, 0.0],
+            [4.0, 0.0],
+            [6.0, 0.0],
+        ]
+    )
+
+    def get_selected_df(self) -> pd.DataFrame:
+        raise AssertionError("metadata-free selections must use visualizer state")
+
+
 def test_visualizer_wrapper_preserves_run_selection_and_object_metadata(
     tmp_path: Path,
     catalog: pd.DataFrame,
@@ -278,6 +295,26 @@ def test_visualizer_wrapper_preserves_run_selection_and_object_metadata(
         selected_objects.columns
     )
     assert set(selected_objects["selection_name"]) == {"upper-left lasso"}
+
+
+def test_visualizer_wrapper_handles_hyrax_with_no_metadata_fields(
+    tmp_path: Path,
+    catalog: pd.DataFrame,
+) -> None:
+    result_dir = tmp_path / "umap"
+    _write_umap_result(result_dir)
+    evaluation = evaluate_visualizer_selection(
+        _test_run(result_dir),
+        _MetadataFreeVisualizer(),
+        catalog,
+        OVERLAYS,
+        selection_name="metadata-free lasso",
+    )
+
+    assert len(evaluation.summary) == 2
+    assert set(evaluation.summary["n_selected"]) == {4}
+    assert len(evaluation.selected_objects) == 8
+    assert set(evaluation.selected_objects["object_id"]) == {"1", "2", "5", "7"}
 
 
 def test_plot_selection_results_facets_targets_at_metric_coordinates(

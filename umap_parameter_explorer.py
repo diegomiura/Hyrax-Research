@@ -1252,6 +1252,47 @@ def _prepend_metadata(frame: Any, metadata: Mapping[str, Any]):
     return result
 
 
+def _visualizer_selected_dataframe(visualizer: Any):
+    """Return selected rows, including a fallback for metadata-free Hyrax runs.
+
+    Hyrax ``Visualize.get_selected_df`` currently constructs an invalid pandas
+    frame when ``data_fields`` is empty. The visualizer selection streams have
+    already populated ``points_id`` and ``points`` in that case, so build the
+    equivalent three-column frame directly without changing the Hyrax checkout.
+    """
+    import numpy as np
+    import pandas as pd
+
+    data_fields = getattr(visualizer, "data_fields", None)
+    if data_fields != []:
+        selected_df = visualizer.get_selected_df()
+        if not isinstance(selected_df, pd.DataFrame):
+            raise TypeError("visualizer.get_selected_df() must return a pandas DataFrame")
+        return selected_df
+
+    object_id_column = getattr(visualizer, "object_id_column_name", "object_id")
+    points_id = np.asarray(getattr(visualizer, "points_id", np.array([])))
+    points = np.asarray(getattr(visualizer, "points", np.array([])))
+    if points_id.ndim != 1:
+        raise ValueError(
+            f"visualizer.points_id must be one-dimensional; got shape {points_id.shape}"
+        )
+    if len(points_id) == 0:
+        return pd.DataFrame(columns=[object_id_column, "x", "y"])
+    if points.ndim != 2 or points.shape[1] < 2 or len(points) != len(points_id):
+        raise ValueError(
+            "visualizer selection coordinates must have shape (N, 2) and align "
+            f"with points_id; got points={points.shape}, points_id={points_id.shape}"
+        )
+    return pd.DataFrame(
+        {
+            object_id_column: points_id,
+            "x": points[:, 0],
+            "y": points[:, 1],
+        }
+    )
+
+
 def evaluate_visualizer_selection(
     run: UmapRun,
     visualizer: Any,
@@ -1267,8 +1308,6 @@ def evaluate_visualizer_selection(
     represented in long form so their known-label and target membership can be
     inspected for every target rule without mutating or saving notebook state.
     """
-    import pandas as pd
-
     import static_umap_metrics as metrics
 
     selection_name = str(selection_name).strip()
@@ -1279,9 +1318,7 @@ def evaluate_visualizer_selection(
     if not hasattr(visualizer, "get_selected_df"):
         raise TypeError("visualizer must provide get_selected_df()")
 
-    selected_df = visualizer.get_selected_df()
-    if not isinstance(selected_df, pd.DataFrame):
-        raise TypeError("visualizer.get_selected_df() must return a pandas DataFrame")
+    selected_df = _visualizer_selected_dataframe(visualizer)
 
     selected_id_column = getattr(visualizer, "object_id_column_name", None)
     id_candidates = [
