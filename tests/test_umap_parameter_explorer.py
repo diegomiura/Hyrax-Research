@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 
 import umap_parameter_explorer as explorer
@@ -311,3 +312,28 @@ def test_local_fixture_controls_variant_cache_and_visualizer(tmp_path: Path) -> 
     )
     assert pane is not None
     assert visualizer.umap_results.results_dir == variant.result_dir
+
+    variant_ids, _ = explorer.load_embedding_arrays(variant.result_dir)
+    merger_catalog = pd.DataFrame(
+        {
+            "object_id": variant_ids[:3],
+            "Major_TimeSinceMerger": [0.1, 0.5, 2.0],
+        }
+    )
+    merger_overlay = explorer.build_merger_time_overlay(
+        variant,
+        merger_catalog,
+        "major",
+        1.0,
+    )
+    overlay_pane, overlay_visualizer = explorer.open_visualizer(
+        variant,
+        display_images=False,
+        overlays=[merger_overlay.visualizer_overlay],
+        width=350,
+        height=350,
+    )
+    assert overlay_pane is not None
+    assert len(overlay_visualizer.overlays) == 1
+    assert overlay_visualizer.overlays[0].label == "Major merger <= 1 Gyr ago"
+    assert len(overlay_visualizer.overlays[0].umap_indices) == 2

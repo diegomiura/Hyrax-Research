@@ -13,7 +13,9 @@ from umap_parameter_explorer import (
     ExperimentRef,
     UmapParams,
     UmapRun,
+    build_merger_time_overlay,
     evaluate_visualizer_selection,
+    open_visualizer,
     plot_selection_results,
     selection_results_table,
 )
@@ -230,6 +232,114 @@ def _test_run(result_dir: Path) -> UmapRun:
         label="candidate A",
         seed=42,
     )
+
+
+def test_build_merger_time_overlay_aligns_display_and_scoring_rules(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "umap"
+    _write_umap_result(result_dir)
+    catalog = pd.DataFrame(
+        {
+            # ID 1 is repeated consistently; ID 8 is a target absent from the UMAP.
+            "object_id": [1, 1, 2, 3, 4, 5, 8],
+            "Major_TimeSinceMerger": [0.2, 0.2, 1.0, 1.1, -1.0, np.nan, 0.5],
+        }
+    )
+
+    overlay = build_merger_time_overlay(
+        _test_run(result_dir),
+        catalog,
+        "MAJOR",
+        1.0,
+    )
+
+    assert overlay.merger_type == "major"
+    assert overlay.cutoff_gyr == 1.0
+    assert overlay.catalog_key == "Major_TimeSinceMerger"
+    assert overlay.label == "Major merger <= 1 Gyr ago"
+    assert overlay.n_catalog_targets == 3
+    assert overlay.n_umap_targets == 2
+    assert overlay.target_rule["min_value"] == 0.0
+    assert overlay.target_rule["max_value"] == 1.0
+    assert overlay.target_rule["include_max"] is True
+    displayed_ids = overlay.visualizer_overlay["catalog"]["object_id"].tolist()
+    assert displayed_ids == ["1", "2"]
+
+    score = metrics.compute_selection_completeness_purity(
+        UMAP_IDS,
+        ["1"],
+        catalog,
+        [overlay.target_rule],
+    )["summary"].iloc[0]
+    assert score["n_targets"] == 2
+    assert score["true_positives"] == 1
+    assert score["completeness"] == pytest.approx(0.5)
+    assert score["purity"] == pytest.approx(1.0)
+
+
+def test_build_merger_time_overlay_validates_controls_and_catalog_conflicts(
+    tmp_path: Path,
+) -> None:
+    result_dir = tmp_path / "umap"
+    _write_umap_result(result_dir)
+    run = _test_run(result_dir)
+    valid_catalog = pd.DataFrame(
+        {"object_id": [1], "Mini_TimeSinceMerger": [0.5]}
+    )
+
+    with pytest.raises(ValueError, match="mini.*minor.*major"):
+        build_merger_time_overlay(run, valid_catalog, "micro", 1.0)
+    with pytest.raises(ValueError, match="finite non-negative"):
+        build_merger_time_overlay(run, valid_catalog, "mini", -1.0)
+    with pytest.raises(KeyError, match="No time-since-merger column"):
+        build_merger_time_overlay(run, valid_catalog, "major", 1.0)
+
+    conflicting_catalog = pd.DataFrame(
+        {
+            "object_id": [1, 1],
+            "Minor_TimeSinceMerger": [0.5, 2.0],
+        }
+    )
+    with pytest.raises(ValueError, match="disagree on merger-time target membership"):
+        build_merger_time_overlay(run, conflicting_catalog, "minor", 1.0)
+
+
+def test_open_visualizer_passes_external_overlays_to_hyrax(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    result_dir = tmp_path / "umap"
+    _write_umap_result(result_dir)
+    run = _test_run(result_dir)
+    received: dict[str, object] = {}
+
+    class FakeHyrax:
+        config = {"visualize": {"display_images": False}}
+
+        def visualize(self, **kwargs: object):
+            received.update(kwargs)
+            return "pane", "visualizer"
+
+    monkeypatch.setattr(
+        "umap_parameter_explorer._hyrax_from_config",
+        lambda _: FakeHyrax(),
+    )
+    overlay = {"catalog": pd.DataFrame({"object_id": ["1"]}), "id_column": "object_id"}
+
+    pane, visualizer = open_visualizer(
+        run,
+        display_images=True,
+        overlays=[overlay],
+        width=640,
+    )
+
+    assert pane == "pane"
+    assert visualizer == "visualizer"
+    assert received["input_dir"] == result_dir
+    assert received["return_verb"] is True
+    assert received["overlays"] == [overlay]
+    assert received["width"] == 640
 
 
 class _MockVisualizer:

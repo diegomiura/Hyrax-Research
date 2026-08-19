@@ -182,6 +182,20 @@ class SelectionEvaluation:
     selected_objects: Any
 
 
+@dataclass(frozen=True)
+class MergerTimeOverlay:
+    """One catalog merger-time rule prepared for display and scoring."""
+
+    merger_type: str
+    cutoff_gyr: float
+    catalog_key: str
+    label: str
+    target_rule: Mapping[str, Any]
+    visualizer_overlay: Mapping[str, Any]
+    n_catalog_targets: int
+    n_umap_targets: int
+
+
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
         import tomllib
@@ -1284,7 +1298,181 @@ def plot_grid(
     return fig, axes
 
 
-def open_visualizer(run: UmapRun, *, display_images: bool = False, **plot_options: Any):
+def build_merger_time_overlay(
+    run: UmapRun,
+    catalog: Any,
+    merger_type: str,
+    cutoff_gyr: float,
+    *,
+    catalog_id_column: str | None = None,
+) -> MergerTimeOverlay:
+    """Prepare one mini/minor/major time-since-merger overlay.
+
+    The returned catalog contains only IDs that both satisfy the requested
+    time window and occur in ``run``.  IDs are copied from the UMAP result so
+    Hyrax's overlay cross-match uses exactly the same representation as the
+    plotted points.  ``target_rule`` uses the same inclusive time window for
+    completeness-purity scoring.
+    """
+
+    import numpy as np
+    import pandas as pd
+
+    import static_umap_metrics as metrics
+
+    if not isinstance(run, UmapRun):
+        raise TypeError("run must be a UmapRun")
+    if catalog is None or not hasattr(catalog, "columns"):
+        raise TypeError("catalog must be a pandas-like table with columns")
+
+    normalized_type = str(merger_type).strip().lower()
+    styles = {
+        "major": {
+            "color": "#d62728",
+            "static_marker": "x",
+            "visualizer_marker": "x",
+        },
+        "minor": {
+            "color": "#2ca02c",
+            "static_marker": "s",
+            "visualizer_marker": "square",
+        },
+        "mini": {
+            "color": "#1f77b4",
+            "static_marker": ".",
+            "visualizer_marker": "circle",
+        },
+    }
+    if normalized_type not in styles:
+        raise ValueError(
+            "merger_type must be 'mini', 'minor', or 'major'; "
+            f"got {merger_type!r}"
+        )
+
+    if isinstance(cutoff_gyr, bool):
+        raise ValueError("cutoff_gyr must be a finite non-negative number")
+    try:
+        cutoff = float(cutoff_gyr)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("cutoff_gyr must be a finite non-negative number") from exc
+    if not np.isfinite(cutoff) or cutoff < 0:
+        raise ValueError("cutoff_gyr must be a finite non-negative number")
+
+    title_type = normalized_type.title()
+    catalog_key = metrics.first_present_column(
+        catalog,
+        [
+            f"{title_type}_TimeSinceMerger",
+            f"{normalized_type}_time_since_merger",
+        ],
+    )
+    if catalog_key is None:
+        raise KeyError(
+            f"No time-since-merger column found for {normalized_type!r}. Expected "
+            f"'{title_type}_TimeSinceMerger' or "
+            f"'{normalized_type}_time_since_merger'."
+        )
+
+    resolved_id_column = metrics.resolve_catalog_id_column(
+        catalog,
+        catalog_id_column,
+    )
+    values = pd.to_numeric(catalog[catalog_key], errors="coerce")
+    known_mask = values.notna() & np.isfinite(values)
+    labels = pd.DataFrame(
+        {
+            "_match_id": metrics.normalize_object_ids(catalog[resolved_id_column]),
+            "_is_target": (known_mask & (values >= 0.0) & (values <= cutoff)),
+            "_is_known": known_mask,
+        }
+    )
+    known = labels.loc[
+        labels["_match_id"].notna() & labels["_is_known"],
+        ["_match_id", "_is_target"],
+    ].drop_duplicates()
+
+    if not known.empty:
+        membership_counts = known.groupby("_match_id", sort=False)["_is_target"].nunique()
+        conflicts = membership_counts[membership_counts > 1].index.tolist()
+        if conflicts:
+            raise ValueError(
+                "Repeated catalog rows disagree on merger-time target membership for "
+                f"{len(conflicts)} object IDs. First conflicts: {conflicts[:5]}"
+            )
+
+    target_ids = known.loc[known["_is_target"], "_match_id"].drop_duplicates()
+    n_catalog_targets = len(target_ids)
+    if n_catalog_targets == 0:
+        raise ValueError(
+            f"No catalog objects satisfy the {title_type} merger cutoff of {cutoff:g} Gyr"
+        )
+
+    umap_ids, _ = load_embedding_arrays(run.result_dir)
+    normalized_umap_ids = metrics.normalize_object_ids(umap_ids)
+    if normalized_umap_ids.isna().any():
+        raise ValueError("UMAP contains missing object IDs")
+    duplicated_umap_ids = normalized_umap_ids.duplicated(keep=False)
+    if duplicated_umap_ids.any():
+        duplicates = (
+            normalized_umap_ids[duplicated_umap_ids]
+            .drop_duplicates()
+            .head()
+            .tolist()
+        )
+        raise ValueError(
+            "UMAP object IDs must be unique for merger overlays. "
+            f"First duplicate IDs: {duplicates}"
+        )
+
+    target_id_set = set(target_ids.tolist())
+    matched_mask = normalized_umap_ids.isin(target_id_set).to_numpy(dtype=bool)
+    matched_umap_ids = np.asarray(umap_ids)[matched_mask].astype(str)
+    n_umap_targets = len(matched_umap_ids)
+    if n_umap_targets == 0:
+        raise ValueError(
+            f"No {title_type} merger targets at <= {cutoff:g} Gyr occur in {run.artifact.ref.key}"
+        )
+
+    label = f"{title_type} merger <= {cutoff:g} Gyr ago"
+    style = styles[normalized_type]
+    target_rule = {
+        "key": catalog_key,
+        "min_value": 0.0,
+        "max_value": cutoff,
+        "include_min": True,
+        "include_max": True,
+        "color": style["color"],
+        "marker": style["static_marker"],
+        "label": label,
+        "s": 12,
+    }
+    visualizer_overlay = {
+        "catalog": pd.DataFrame({"object_id": matched_umap_ids}),
+        "id_column": "object_id",
+        "color": style["color"],
+        "marker": style["visualizer_marker"],
+        "size": 10,
+        "label": label,
+    }
+    return MergerTimeOverlay(
+        merger_type=normalized_type,
+        cutoff_gyr=cutoff,
+        catalog_key=catalog_key,
+        label=label,
+        target_rule=target_rule,
+        visualizer_overlay=visualizer_overlay,
+        n_catalog_targets=n_catalog_targets,
+        n_umap_targets=n_umap_targets,
+    )
+
+
+def open_visualizer(
+    run: UmapRun,
+    *,
+    display_images: bool = False,
+    overlays: Sequence[Mapping[str, Any]] | None = None,
+    **plot_options: Any,
+):
     """Open a historical/control/variant result through Hyrax's visualize verb."""
 
     hyrax_instance = _hyrax_from_config(run.artifact.config_path)
@@ -1292,6 +1480,7 @@ def open_visualizer(run: UmapRun, *, display_images: bool = False, **plot_option
     pane, visualizer = hyrax_instance.visualize(
         input_dir=run.result_dir,
         return_verb=True,
+        overlays=list(overlays) if overlays is not None else None,
         **plot_options,
     )
     return pane, visualizer
@@ -1544,11 +1733,13 @@ __all__ = [
     "ExperimentArtifacts",
     "ExperimentRef",
     "ExplorationError",
+    "MergerTimeOverlay",
     "ParameterValidationError",
     "SelectionEvaluation",
     "UmapParams",
     "UmapRun",
     "artifacts_table",
+    "build_merger_time_overlay",
     "diagnose_runs",
     "discover_experiment",
     "ensure_controls",
@@ -1565,6 +1756,7 @@ __all__ = [
     "projection_diagnostics",
     "rebuild_manifest",
     "run_all",
+    "run_parameter_sweep",
     "run_selected",
     "runs_table",
     "selection_results_table",
