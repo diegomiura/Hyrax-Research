@@ -123,6 +123,84 @@ def test_cache_identity_and_slug_are_stable(tmp_path: Path) -> None:
     assert explorer._hash_json(changed) != key
 
 
+@pytest.mark.parametrize(
+    ("parameter", "values", "expected_keys"),
+    [
+        ("n_neighbors", [5, 30], [5, 30]),
+        ("min_dist", [0, 0.5], [0.0, 0.5]),
+        ("metric", ["COSINE", "manhattan"], ["cosine", "manhattan"]),
+    ],
+)
+def test_run_parameter_sweep_changes_only_the_requested_parameter(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    parameter: str,
+    values: list[object],
+    expected_keys: list[object],
+) -> None:
+    run_base, _, _ = _write_discovery_fixture(tmp_path)
+    artifact = explorer.discover_experiment(explorer.ExperimentRef(3, 7), run_base)
+    calls: list[tuple[explorer.UmapParams, dict[str, object]]] = []
+
+    def fake_run_selected(
+        received_artifact: explorer.ExperimentArtifacts,
+        params: explorer.UmapParams,
+        **kwargs: object,
+    ) -> explorer.UmapRun:
+        assert received_artifact is artifact
+        calls.append((params, kwargs))
+        return explorer.UmapRun(
+            artifact=artifact,
+            result_dir=tmp_path / f"result-{len(calls)}",
+            params=params,
+            label=str(kwargs["label"]),
+            seed=int(kwargs["seed"]),
+        )
+
+    monkeypatch.setattr(explorer, "run_selected", fake_run_selected)
+    runs = explorer.run_parameter_sweep(
+        artifact,
+        parameter,
+        values,
+        output_root=tmp_path,
+        session="sweep-test",
+        seed=17,
+        evaluation_size=40,
+        diagnostic_k=4,
+    )
+
+    assert list(runs) == expected_keys
+    assert len(calls) == len(values)
+    for key, (params, kwargs) in zip(expected_keys, calls, strict=True):
+        assert getattr(params, parameter) == key
+        for unchanged in {"n_neighbors", "min_dist", "metric"} - {parameter}:
+            assert getattr(params, unchanged) == getattr(artifact.original_params, unchanged)
+        assert kwargs["label"] == f"{parameter}={key}"
+        assert kwargs["session"] == "sweep-test"
+        assert kwargs["evaluation_size"] == 40
+        assert kwargs["diagnostic_k"] == 4
+
+
+def test_run_parameter_sweep_rejects_invalid_empty_and_duplicate_values(
+    tmp_path: Path,
+) -> None:
+    run_base, _, _ = _write_discovery_fixture(tmp_path)
+    artifact = explorer.discover_experiment(explorer.ExperimentRef(3, 7), run_base)
+    common = {"output_root": tmp_path, "session": "sweep-test"}
+
+    with pytest.raises(ValueError, match="parameter must be one of"):
+        explorer.run_parameter_sweep(artifact, "spread", [1], **common)
+    with pytest.raises(ValueError, match="at least one"):
+        explorer.run_parameter_sweep(artifact, "metric", [], **common)
+    with pytest.raises(ValueError, match="Duplicate normalized metric"):
+        explorer.run_parameter_sweep(
+            artifact,
+            "metric",
+            ["COSINE", " cosine "],
+            **common,
+        )
+
+
 def test_manifest_ignores_incomplete_results(tmp_path: Path) -> None:
     session_dir = tmp_path / "session"
     complete = session_dir / "run1_expt1" / "variant-complete"

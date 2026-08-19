@@ -1096,6 +1096,73 @@ def run_all(
     return runs
 
 
+def run_parameter_sweep(
+    artifact: ExperimentArtifacts,
+    parameter: str,
+    values: Sequence[Any],
+    *,
+    output_root: str | Path,
+    session: str,
+    seed: int = DEFAULT_RANDOM_SEED,
+    baseline_params: UmapParams | None = None,
+    evaluation_size: int = DEFAULT_EVALUATION_SIZE,
+    diagnostic_k: int = DEFAULT_DIAGNOSTIC_K,
+) -> dict[Any, UmapRun]:
+    """Run one-at-a-time variants of a single UMAP parameter.
+
+    Parameters not named by ``parameter`` are copied from ``baseline_params``;
+    by default, the experiment's historical parameters are the baseline.  The
+    returned mapping preserves the requested value order and uses normalized
+    parameter values as keys, making notebook selections such as
+    ``n_neighbors_sweep[30]`` straightforward.  Existing completed variants
+    are reused through :func:`run_selected`.
+    """
+
+    allowed_parameters = {"n_neighbors", "min_dist", "metric"}
+    if parameter not in allowed_parameters:
+        raise ValueError(
+            f"parameter must be one of {sorted(allowed_parameters)}; got {parameter!r}"
+        )
+
+    requested_values = list(values)
+    if not requested_values:
+        raise ValueError("values must contain at least one sweep value")
+
+    baseline = baseline_params or artifact.original_params
+    baseline_record = {
+        "n_neighbors": baseline.n_neighbors,
+        "min_dist": baseline.min_dist,
+        "metric": baseline.metric,
+    }
+    sweep_specs: list[tuple[Any, UmapParams]] = []
+    normalized_values: set[Any] = set()
+    for requested_value in requested_values:
+        parameter_record = dict(baseline_record)
+        parameter_record[parameter] = requested_value
+        params = UmapParams(**parameter_record)
+        normalized_value = getattr(params, parameter)
+        if normalized_value in normalized_values:
+            raise ValueError(
+                f"Duplicate normalized {parameter} sweep value: {normalized_value!r}"
+            )
+        normalized_values.add(normalized_value)
+        sweep_specs.append((normalized_value, params))
+
+    runs: dict[Any, UmapRun] = {}
+    for normalized_value, params in sweep_specs:
+        runs[normalized_value] = run_selected(
+            artifact,
+            params,
+            output_root=output_root,
+            session=session,
+            seed=seed,
+            label=f"{parameter}={normalized_value}",
+            evaluation_size=evaluation_size,
+            diagnostic_k=diagnostic_k,
+        )
+    return runs
+
+
 def ensure_controls(
     artifacts: Mapping[ExperimentRef, ExperimentArtifacts],
     *,
@@ -1157,8 +1224,8 @@ def diagnose_runs(
     return diagnosed
 
 
-def runs_table(runs: Mapping[ExperimentRef, UmapRun]):
-    """Return one display row per historical/control/variant run."""
+def runs_table(runs: Mapping[Any, UmapRun]):
+    """Return one display row per historical, control, variant, or sweep run."""
 
     import pandas as pd
 
