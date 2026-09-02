@@ -830,6 +830,86 @@ def nearest_target_distances(
     return distances
 
 
+def nearest_anchor_distances(
+    coords: Any,
+    anchor_mask: Any,
+    evaluation_mask: Any = None,
+    n_neighbors: int = 1,
+):
+    """Score evaluated points by distance to their kth nearest anchor.
+
+    Unlike :func:`nearest_target_distances`, anchors and evaluated queries are
+    separate populations. This is the appropriate primitive for holdout
+    validation: training targets define the spatial selection, while only test
+    objects receive scores.
+
+    Parameters
+    ----------
+    coords
+        Coordinates with one row per point. One-dimensional input is treated
+        as a single coordinate feature.
+    anchor_mask
+        Boolean mask identifying the training target anchors.
+    evaluation_mask
+        Optional boolean mask identifying the points to score. Defaults to all
+        non-anchor points.
+    n_neighbors
+        Rank of the anchor neighbor to use (3 means the distance to the third
+        nearest training target).
+
+    Returns
+    -------
+    numpy.ndarray
+        One distance per input row, with ``NaN`` outside the evaluation set.
+    """
+    init_tabular_stack()
+    from sklearn.neighbors import NearestNeighbors
+
+    coords = _as_2d_numeric_array(coords)
+    n_points = len(coords)
+    anchor_mask = _validated_boolean_mask(anchor_mask, n_points, "anchor_mask")
+    if evaluation_mask is None:
+        evaluation_mask = ~anchor_mask
+    else:
+        evaluation_mask = _validated_boolean_mask(
+            evaluation_mask,
+            n_points,
+            "evaluation_mask",
+        )
+
+    if np.any(anchor_mask & evaluation_mask):
+        raise ValueError("anchor_mask and evaluation_mask must be disjoint")
+    if isinstance(n_neighbors, (bool, np.bool_)) or not isinstance(
+        n_neighbors,
+        (int, np.integer),
+    ):
+        raise TypeError("n_neighbors must be a positive integer")
+    n_neighbors = int(n_neighbors)
+    if n_neighbors < 1:
+        raise ValueError("n_neighbors must be at least 1")
+
+    anchor_indices = np.flatnonzero(anchor_mask)
+    if len(anchor_indices) < n_neighbors:
+        raise ValueError(
+            "nearest-anchor scoring needs at least n_neighbors anchors; "
+            f"got {len(anchor_indices)} anchors for n_neighbors={n_neighbors}"
+        )
+    query_indices = np.flatnonzero(evaluation_mask)
+    if len(query_indices) == 0:
+        raise ValueError("evaluation_mask does not select any points")
+
+    neighbors = NearestNeighbors(n_neighbors=n_neighbors, metric="euclidean")
+    neighbors.fit(coords[anchor_indices])
+    neighbor_distances = neighbors.kneighbors(
+        coords[query_indices],
+        return_distance=True,
+    )[0]
+
+    distances = np.full(n_points, np.nan, dtype=float)
+    distances[query_indices] = neighbor_distances[:, n_neighbors - 1]
+    return distances
+
+
 def distance_completeness_purity_curve(
     distances: Any,
     target_mask: Any,
@@ -1428,6 +1508,302 @@ def compute_overlay_completeness_purity(
         "curve": curve,
         "summary": summary,
         "distances": distances,
+        "target_mask": target_mask,
+        "evaluation_mask": evaluation_mask,
+        "catalog_id_column": resolved_id_column,
+    }
+
+
+def _aggregate_holdout_curves(split_curves: Any, grid_size: int = 101):
+    """Summarize repeated holdout curves on a common completeness grid."""
+    completeness_grid = np.linspace(0.0, 1.0, grid_size)
+    rows = []
+    grouped = [curve for _, curve in split_curves.groupby("split_index", sort=True)]
+
+    for requested_completeness in completeness_grid:
+        operating_points = []
+        for curve in grouped:
+            eligible = curve.loc[
+                curve["completeness"] >= requested_completeness - 1e-12
+            ]
+            operating_points.append(
+                eligible.iloc[0] if not eligible.empty else curve.iloc[-1]
+            )
+
+        points = pd.DataFrame(operating_points)
+        purity = points["purity"].to_numpy(dtype=float)
+        if requested_completeness == 0.0:
+            distance_threshold = (-np.inf, -np.inf, -np.inf)
+        else:
+            thresholds = points["distance_threshold"].to_numpy(dtype=float)
+            distance_threshold = tuple(
+                float(value) for value in np.quantile(thresholds, [0.5, 0.16, 0.84])
+            )
+
+        rows.append(
+            {
+                "completeness": float(requested_completeness),
+                "purity": float(np.median(purity)),
+                "purity_p16": float(np.quantile(purity, 0.16)),
+                "purity_p84": float(np.quantile(purity, 0.84)),
+                "distance_threshold": distance_threshold[0],
+                "distance_threshold_p16": distance_threshold[1],
+                "distance_threshold_p84": distance_threshold[2],
+                "n_selected": float(np.median(points["n_selected"])),
+                "n_splits": len(grouped),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def compute_overlay_holdout_completeness_purity(
+    umap_data: Mapping[str, Any],
+    catalog: Any,
+    overlay: Mapping[str, Any],
+    n_neighbors: int = 3,
+    test_fraction: float = 0.5,
+    n_splits: int = 100,
+    seed: int = 42,
+    catalog_id_column: str | None = None,
+) -> dict[str, Any]:
+    """Evaluate a kth-nearest-merger selection on stratified test halves.
+
+    Each repetition independently splits known mergers and nonmergers into
+    training and test populations. Only the training mergers are spatial
+    anchors. A test object is selected at radius ``r`` when its kth-nearest
+    training merger is no farther than ``r``; no training object contributes
+    to purity or completeness.
+
+    The aggregate ``curve`` reports median test purity and 16th--84th
+    percentile bands on a common completeness grid. ``summary`` contains
+    medians and the same percentile bounds for scalar metrics. Raw per-split
+    results are retained in ``split_curves`` and ``split_summaries``. The
+    ``split_train_masks``, ``split_test_masks``, and ``split_anchor_masks``
+    arrays are aligned to the original UMAP row order.
+    """
+    init_tabular_stack()
+
+    if catalog is None:
+        raise ValueError("A catalog DataFrame is required for holdout analysis.")
+    if not isinstance(overlay, Mapping):
+        raise TypeError("overlay must be a mapping specification")
+    for coordinate in ("x", "y", "rubin_ids"):
+        if coordinate not in umap_data:
+            raise KeyError(f"umap_data must contain a '{coordinate}' array")
+
+    if isinstance(n_splits, (bool, np.bool_)) or not isinstance(
+        n_splits,
+        (int, np.integer),
+    ):
+        raise TypeError("n_splits must be a positive integer")
+    n_splits = int(n_splits)
+    if n_splits < 1:
+        raise ValueError("n_splits must be at least 1")
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(
+        seed,
+        (int, np.integer),
+    ):
+        raise TypeError("seed must be an integer")
+    seed = int(seed)
+    if isinstance(test_fraction, (bool, np.bool_)):
+        raise TypeError("test_fraction must be a finite number between 0 and 1")
+    try:
+        test_fraction = float(test_fraction)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(
+            "test_fraction must be a finite number between 0 and 1"
+        ) from exc
+    if not math.isfinite(test_fraction) or not 0.0 < test_fraction < 1.0:
+        raise ValueError("test_fraction must be strictly between 0 and 1")
+
+    resolved_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
+    coords = _as_2d_numeric_array(
+        np.column_stack([umap_data["x"], umap_data["y"]]),
+        name="UMAP coordinates",
+    )
+    if len(umap_data["rubin_ids"]) != len(coords):
+        raise ValueError(
+            "UMAP coordinates and rubin_ids must have the same length: "
+            f"{len(coords)} vs {len(umap_data['rubin_ids'])}"
+        )
+
+    evaluation_mask = overlay_evaluation_mask(
+        umap_data,
+        catalog,
+        overlay,
+        catalog_id_column=resolved_id_column,
+    )
+    target_mask = overlay_labeled_mask(
+        umap_data,
+        catalog,
+        overlay,
+        catalog_id_column=resolved_id_column,
+    )
+    target_mask &= evaluation_mask
+
+    target_indices = np.flatnonzero(evaluation_mask & target_mask)
+    non_target_indices = np.flatnonzero(evaluation_mask & ~target_mask)
+    if len(target_indices) < 2:
+        raise ValueError(
+            "stratified holdout analysis needs at least two evaluated targets"
+        )
+    if len(non_target_indices) < 2:
+        raise ValueError(
+            "stratified holdout analysis needs at least two evaluated non-targets"
+        )
+
+    n_test_targets = int(math.ceil(len(target_indices) * test_fraction))
+    n_test_non_targets = int(math.ceil(len(non_target_indices) * test_fraction))
+    if not 1 <= n_test_targets < len(target_indices):
+        raise ValueError(
+            "test_fraction leaves no targets in either the training or test population"
+        )
+    if not 1 <= n_test_non_targets < len(non_target_indices):
+        raise ValueError(
+            "test_fraction leaves no non-targets in either the training or test population"
+        )
+
+    n_train_targets = len(target_indices) - n_test_targets
+    if isinstance(n_neighbors, (bool, np.bool_)) or not isinstance(
+        n_neighbors,
+        (int, np.integer),
+    ):
+        raise TypeError("n_neighbors must be a positive integer")
+    n_neighbors = int(n_neighbors)
+    if n_neighbors < 1:
+        raise ValueError("n_neighbors must be at least 1")
+    if n_train_targets < n_neighbors:
+        raise ValueError(
+            "The training split needs at least n_neighbors merger anchors; "
+            f"got {n_train_targets} training targets for n_neighbors={n_neighbors}. "
+            "Reduce n_neighbors or test_fraction."
+        )
+
+    rng = np.random.default_rng(seed)
+    n_points = len(coords)
+    split_curve_frames = []
+    split_summary_rows = []
+    split_distances = np.full((n_splits, n_points), np.nan, dtype=float)
+    split_test_masks = np.zeros((n_splits, n_points), dtype=bool)
+    split_train_masks = np.zeros((n_splits, n_points), dtype=bool)
+    split_anchor_masks = np.zeros((n_splits, n_points), dtype=bool)
+
+    for split_index in range(n_splits):
+        shuffled_targets = rng.permutation(target_indices)
+        shuffled_non_targets = rng.permutation(non_target_indices)
+        test_indices = np.concatenate(
+            [
+                shuffled_targets[:n_test_targets],
+                shuffled_non_targets[:n_test_non_targets],
+            ]
+        )
+        anchor_indices = shuffled_targets[n_test_targets:]
+
+        test_mask = np.zeros(n_points, dtype=bool)
+        test_mask[test_indices] = True
+        train_mask = evaluation_mask & ~test_mask
+        anchor_mask = np.zeros(n_points, dtype=bool)
+        anchor_mask[anchor_indices] = True
+
+        distances = nearest_anchor_distances(
+            coords,
+            anchor_mask,
+            evaluation_mask=test_mask,
+            n_neighbors=n_neighbors,
+        )
+        curve, split_summary = distance_completeness_purity_curve(
+            distances,
+            target_mask,
+            evaluation_mask=test_mask,
+        )
+
+        n_test = int(test_mask.sum())
+        n_train = int(evaluation_mask.sum()) - n_test
+        split_summary.update(
+            {
+                "split_index": split_index,
+                "n_known_total": int(evaluation_mask.sum()),
+                "n_targets_total": int(target_mask.sum()),
+                "n_train": n_train,
+                "n_train_targets": n_train_targets,
+                "n_train_non_targets": n_train - n_train_targets,
+                "n_test": n_test,
+                "n_test_targets": n_test_targets,
+                "n_test_non_targets": n_test_non_targets,
+                "test_fraction": test_fraction,
+                "actual_test_fraction": float(n_test / evaluation_mask.sum()),
+                "target_neighbor_rank": n_neighbors,
+                "evaluation_scheme": "stratified_holdout_target_anchor",
+                "seed": seed,
+            }
+        )
+        curve["split_index"] = split_index
+        curve["n_train"] = n_train
+        curve["n_train_targets"] = n_train_targets
+        curve["n_test"] = n_test
+        curve["n_test_targets"] = n_test_targets
+
+        split_curve_frames.append(curve)
+        split_summary_rows.append(split_summary)
+        split_distances[split_index] = distances
+        split_test_masks[split_index] = test_mask
+        split_train_masks[split_index] = train_mask
+        split_anchor_masks[split_index] = anchor_mask
+
+    split_curves = pd.concat(split_curve_frames, ignore_index=True)
+    split_summaries = pd.DataFrame(split_summary_rows)
+    aggregate_curve = _aggregate_holdout_curves(split_curves)
+
+    first = split_summaries.iloc[0]
+    summary = {
+        "n_splits": n_splits,
+        "seed": seed,
+        "test_fraction": test_fraction,
+        "actual_test_fraction": float(first["actual_test_fraction"]),
+        "n_known_total": int(first["n_known_total"]),
+        "n_targets_total": int(first["n_targets_total"]),
+        "n_train": int(first["n_train"]),
+        "n_train_targets": int(first["n_train_targets"]),
+        "n_train_non_targets": int(first["n_train_non_targets"]),
+        "n_test": int(first["n_test"]),
+        "n_test_targets": int(first["n_test_targets"]),
+        "n_test_non_targets": int(first["n_test_non_targets"]),
+        # Preserve the standard summary names, but make their test-only
+        # denominators explicit through the companion n_test fields.
+        "n_evaluated": int(first["n_evaluated"]),
+        "n_scored": int(first["n_scored"]),
+        "n_unscored": int(first["n_unscored"]),
+        "n_targets": int(first["n_targets"]),
+        "prevalence": float(np.median(split_summaries["prevalence"])),
+        "target_neighbor_rank": n_neighbors,
+        "evaluation_scheme": "stratified_holdout_target_anchor",
+    }
+
+    scalar_metrics = [
+        "average_precision",
+        "ap_lift",
+        "best_f1",
+        "best_distance_threshold",
+        "best_completeness",
+        "best_purity",
+        "best_n_selected",
+    ]
+    for metric in scalar_metrics:
+        values = split_summaries[metric].to_numpy(dtype=float)
+        summary[metric] = float(np.median(values))
+        summary[f"{metric}_p16"] = float(np.quantile(values, 0.16))
+        summary[f"{metric}_p84"] = float(np.quantile(values, 0.84))
+
+    return {
+        "curve": aggregate_curve,
+        "summary": summary,
+        "split_curves": split_curves,
+        "split_summaries": split_summaries,
+        "split_distances": split_distances,
+        "split_test_masks": split_test_masks,
+        "split_train_masks": split_train_masks,
+        "split_anchor_masks": split_anchor_masks,
         "target_mask": target_mask,
         "evaluation_mask": evaluation_mask,
         "catalog_id_column": resolved_id_column,

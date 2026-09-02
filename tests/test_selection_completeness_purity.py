@@ -468,3 +468,141 @@ def test_plot_selection_results_facets_targets_at_metric_coordinates(
 
 def test_selection_results_table_empty_input() -> None:
     assert selection_results_table([]).empty
+
+
+def _holdout_inputs(n_targets: int = 8, n_non_targets: int = 8):
+    n_objects = n_targets + n_non_targets
+    object_ids = np.arange(n_objects)
+    umap_data = {
+        "rubin_ids": object_ids.astype(str),
+        "x": np.concatenate(
+            [
+                np.linspace(0.0, 0.7, n_targets),
+                np.linspace(10.0, 10.7, n_non_targets),
+            ]
+        ),
+        "y": np.zeros(n_objects),
+    }
+    holdout_catalog = pd.DataFrame(
+        {
+            "object_id": object_ids,
+            "merger": np.concatenate(
+                [np.ones(n_targets), np.zeros(n_non_targets)]
+            ),
+        }
+    )
+    overlay = {"key": "merger", "threshold": 0.5, "label": "Merger"}
+    return umap_data, holdout_catalog, overlay
+
+
+def test_holdout_analysis_uses_only_stratified_test_halves() -> None:
+    umap_data, holdout_catalog, overlay = _holdout_inputs()
+    result = metrics.compute_overlay_holdout_completeness_purity(
+        umap_data,
+        holdout_catalog,
+        overlay,
+        n_neighbors=3,
+        test_fraction=0.5,
+        n_splits=5,
+        seed=17,
+    )
+
+    summary = result["summary"]
+    assert summary["evaluation_scheme"] == "stratified_holdout_target_anchor"
+    assert summary["target_neighbor_rank"] == 3
+    assert summary["n_splits"] == 5
+    assert summary["n_known_total"] == 16
+    assert summary["n_targets_total"] == 8
+    assert summary["n_train"] == 8
+    assert summary["n_train_targets"] == 4
+    assert summary["n_train_non_targets"] == 4
+    assert summary["n_evaluated"] == summary["n_test"] == 8
+    assert summary["n_targets"] == summary["n_test_targets"] == 4
+    assert summary["n_test_non_targets"] == 4
+    assert summary["prevalence"] == pytest.approx(0.5)
+    assert summary["average_precision"] == pytest.approx(1.0)
+    assert summary["best_f1"] == pytest.approx(1.0)
+
+    target_mask = result["target_mask"]
+    for split_index in range(5):
+        test_mask = result["split_test_masks"][split_index]
+        train_mask = result["split_train_masks"][split_index]
+        anchor_mask = result["split_anchor_masks"][split_index]
+        distances = result["split_distances"][split_index]
+
+        assert not np.any(test_mask & train_mask)
+        np.testing.assert_array_equal(
+            test_mask | train_mask,
+            result["evaluation_mask"],
+        )
+        assert not np.any(test_mask & anchor_mask)
+        assert np.all(train_mask[anchor_mask])
+        assert np.all(target_mask[anchor_mask])
+        assert int(anchor_mask.sum()) == 4
+        assert int(np.sum(test_mask & target_mask)) == 4
+        assert int(np.sum(test_mask & ~target_mask)) == 4
+        assert np.all(np.isfinite(distances[test_mask]))
+        assert np.all(np.isnan(distances[~test_mask]))
+
+    split_summaries = result["split_summaries"]
+    assert set(split_summaries["n_evaluated"]) == {8}
+    assert set(split_summaries["n_targets"]) == {4}
+    assert set(split_summaries["average_precision"]) == {1.0}
+    assert np.all(result["curve"]["purity"] == 1.0)
+
+
+def test_holdout_analysis_is_deterministic_for_a_fixed_seed() -> None:
+    umap_data, holdout_catalog, overlay = _holdout_inputs()
+    kwargs = {
+        "n_neighbors": 3,
+        "test_fraction": 0.5,
+        "n_splits": 4,
+        "seed": 91,
+    }
+    first = metrics.compute_overlay_holdout_completeness_purity(
+        umap_data,
+        holdout_catalog,
+        overlay,
+        **kwargs,
+    )
+    second = metrics.compute_overlay_holdout_completeness_purity(
+        umap_data,
+        holdout_catalog,
+        overlay,
+        **kwargs,
+    )
+
+    np.testing.assert_array_equal(
+        first["split_test_masks"],
+        second["split_test_masks"],
+    )
+    np.testing.assert_array_equal(
+        first["split_anchor_masks"],
+        second["split_anchor_masks"],
+    )
+    np.testing.assert_array_equal(
+        first["split_train_masks"],
+        second["split_train_masks"],
+    )
+    np.testing.assert_allclose(
+        first["split_distances"],
+        second["split_distances"],
+        equal_nan=True,
+    )
+    pd.testing.assert_frame_equal(first["split_curves"], second["split_curves"])
+
+
+def test_holdout_analysis_requires_three_training_anchors() -> None:
+    umap_data, holdout_catalog, overlay = _holdout_inputs(
+        n_targets=5,
+        n_non_targets=5,
+    )
+    with pytest.raises(ValueError, match="training split needs at least n_neighbors"):
+        metrics.compute_overlay_holdout_completeness_purity(
+            umap_data,
+            holdout_catalog,
+            overlay,
+            n_neighbors=3,
+            test_fraction=0.5,
+            n_splits=2,
+        )
