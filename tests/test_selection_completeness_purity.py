@@ -606,3 +606,171 @@ def test_holdout_analysis_requires_three_training_anchors() -> None:
             test_fraction=0.5,
             n_splits=2,
         )
+
+
+def test_neighbor_rank_sweep_returns_paired_comparisons_and_fixed_points() -> None:
+    umap_data, holdout_catalog, overlay = _holdout_inputs()
+    result = metrics.compute_overlay_neighbor_rank_sweep(
+        umap_data,
+        holdout_catalog,
+        overlay,
+        neighbor_ranks=[1, 3],
+        test_fraction=0.5,
+        n_splits=4,
+        seed=23,
+    )
+
+    assert result["neighbor_ranks"] == [1, 3]
+    assert result["summary"]["target_neighbor_rank"].tolist() == [1, 3]
+    assert len(result["split_summaries"]) == 8
+    assert set(result["split_summaries"]["split_index"]) == {0, 1, 2, 3}
+
+    paired = metrics.paired_neighbor_rank_differences(result["split_summaries"])
+    assert paired["comparison"].tolist() == ["3 minus 1"]
+    assert paired.iloc[0]["n_paired_splits"] == 4
+    assert paired.iloc[0]["median_change"] == pytest.approx(0.0)
+
+    fixed = metrics.purity_at_fixed_completeness(
+        result["curves"],
+        completeness_values=[0.1, 0.2],
+    )
+    assert len(fixed) == 4
+    assert set(fixed["target_neighbor_rank"]) == {1, 3}
+    assert set(fixed["requested_completeness"]) == {0.1, 0.2}
+    assert np.all(fixed["purity"] == 1.0)
+
+
+def test_neighbor_rank_sweep_rejects_duplicate_ranks() -> None:
+    umap_data, holdout_catalog, overlay = _holdout_inputs()
+    with pytest.raises(ValueError, match="duplicate value 3"):
+        metrics.compute_overlay_neighbor_rank_sweep(
+            umap_data,
+            holdout_catalog,
+            overlay,
+            neighbor_ranks=[1, 3, 3],
+            n_splits=2,
+        )
+
+
+def _nested_inputs():
+    n_targets = 16
+    n_non_targets = 16
+    n_objects = n_targets + n_non_targets
+    object_ids = np.arange(n_objects)
+    return (
+        {
+            "rubin_ids": object_ids.astype(str),
+            "x": np.concatenate([np.zeros(n_targets), np.full(n_non_targets, 10.0)]),
+            "y": np.zeros(n_objects),
+        },
+        pd.DataFrame(
+            {
+                "object_id": object_ids,
+                "merger": np.concatenate(
+                    [np.ones(n_targets), np.zeros(n_non_targets)]
+                ),
+            }
+        ),
+        {"key": "merger", "threshold": 0.5, "label": "Merger"},
+    )
+
+
+def test_nested_analysis_selects_on_validation_and_scores_only_test() -> None:
+    umap_data, nested_catalog, overlay = _nested_inputs()
+    result = metrics.compute_overlay_nested_completeness_purity(
+        umap_data,
+        nested_catalog,
+        overlay,
+        neighbor_ranks=[1, 3, 5],
+        train_fraction=0.5,
+        validation_fraction=0.25,
+        n_splits=5,
+        seed=31,
+    )
+
+    summary = result["summary"]
+    assert summary["evaluation_scheme"] == "nested_stratified_train_validation_test"
+    assert summary["selected_neighbor_rank_mode"] == 1
+    assert summary["n_train"] == 16
+    assert summary["n_train_targets"] == 8
+    assert summary["n_validation"] == 8
+    assert summary["n_validation_targets"] == 4
+    assert summary["n_test"] == 8
+    assert summary["n_test_targets"] == 4
+    assert summary["test_average_precision"] == pytest.approx(1.0)
+    assert summary["test_completeness"] == pytest.approx(1.0)
+    assert summary["test_purity"] == pytest.approx(1.0)
+
+    evaluation_mask = result["evaluation_mask"]
+    target_mask = result["target_mask"]
+    for split_index in range(5):
+        train = result["split_train_masks"][split_index]
+        validation = result["split_validation_masks"][split_index]
+        test = result["split_test_masks"][split_index]
+        anchors = result["split_anchor_masks"][split_index]
+        assert not np.any(train & validation)
+        assert not np.any(train & test)
+        assert not np.any(validation & test)
+        np.testing.assert_array_equal(train | validation | test, evaluation_mask)
+        assert np.all(train[anchors])
+        assert np.all(target_mask[anchors])
+
+
+def test_nested_permutation_control_and_comparison() -> None:
+    umap_data, nested_catalog, overlay = _nested_inputs()
+    observed = metrics.compute_overlay_nested_completeness_purity(
+        umap_data,
+        nested_catalog,
+        overlay,
+        neighbor_ranks=[1, 3],
+        n_splits=8,
+        seed=47,
+    )
+    permuted = metrics.compute_overlay_nested_completeness_purity(
+        umap_data,
+        nested_catalog,
+        overlay,
+        neighbor_ranks=[1, 3],
+        n_splits=8,
+        seed=47,
+        permute_labels=True,
+    )
+    comparison = metrics.compare_nested_permutation_baseline(
+        observed["split_results"],
+        permuted["split_results"],
+        metrics=["test_average_precision"],
+    )
+
+    assert bool(permuted["summary"]["permuted_labels"])
+    assert comparison.iloc[0]["metric"] == "test_average_precision"
+    assert comparison.iloc[0]["observed_median"] == pytest.approx(1.0)
+    assert 0.0 < comparison.iloc[0]["null_exceedance_fraction"] <= 1.0
+
+
+def test_analysis_bundle_round_trip(tmp_path: Path) -> None:
+    tables = {
+        "summary": pd.DataFrame({"rank": [1, 3], "ap": [0.1, 0.2]}),
+        "curves": pd.DataFrame({"completeness": [0.0, 1.0]}),
+    }
+    config = {"neighbor_ranks": [1, 3], "seed": 42}
+    paths = metrics.save_analysis_bundle(
+        tmp_path / "bundle",
+        tables,
+        config,
+        metadata={"label": "test"},
+    )
+    assert paths["manifest"].exists()
+
+    loaded = metrics.load_analysis_bundle(
+        tmp_path / "bundle",
+        expected_config=config,
+    )
+    assert loaded["metadata"] == {"label": "test"}
+    pd.testing.assert_frame_equal(loaded["tables"]["summary"], tables["summary"])
+    pd.testing.assert_frame_equal(loaded["tables"]["curves"], tables["curves"])
+
+    with pytest.raises(ValueError, match="does not match"):
+        metrics.load_analysis_bundle(
+            tmp_path / "bundle",
+            expected_config={"neighbor_ranks": [7]},
+        )

@@ -1810,6 +1810,826 @@ def compute_overlay_holdout_completeness_purity(
     }
 
 
+def _validated_neighbor_ranks(neighbor_ranks: Any) -> list[int]:
+    """Return a non-empty, unique list of positive integer neighbor ranks."""
+    if isinstance(neighbor_ranks, (str, bytes, Mapping)):
+        raise TypeError("neighbor_ranks must be an iterable of positive integers")
+    try:
+        values = list(neighbor_ranks)
+    except TypeError as exc:
+        raise TypeError(
+            "neighbor_ranks must be an iterable of positive integers"
+        ) from exc
+    if not values:
+        raise ValueError("neighbor_ranks must contain at least one value")
+
+    validated = []
+    for value in values:
+        if isinstance(value, (bool, np.bool_)) or not isinstance(
+            value,
+            (int, np.integer),
+        ):
+            raise TypeError("every neighbor rank must be a positive integer")
+        value = int(value)
+        if value < 1:
+            raise ValueError("every neighbor rank must be at least 1")
+        if value in validated:
+            raise ValueError(f"neighbor_ranks contains duplicate value {value}")
+        validated.append(value)
+    return validated
+
+
+def compute_overlay_neighbor_rank_sweep(
+    umap_data: Mapping[str, Any],
+    catalog: Any,
+    overlay: Mapping[str, Any],
+    neighbor_ranks: Any,
+    test_fraction: float = 0.5,
+    n_splits: int = 100,
+    seed: int = 42,
+    catalog_id_column: str | None = None,
+) -> dict[str, Any]:
+    """Run paired stratified holdouts for several target-neighbor ranks.
+
+    Every rank uses the same deterministic train/test memberships, so the raw
+    split summaries support paired comparisons rather than comparisons of
+    unrelated uncertainty intervals.
+    """
+    init_tabular_stack()
+    ranks = _validated_neighbor_ranks(neighbor_ranks)
+    summary_rows = []
+    curve_frames = []
+    split_summary_frames = []
+    split_curve_frames = []
+
+    for neighbor_rank in ranks:
+        result = compute_overlay_holdout_completeness_purity(
+            umap_data,
+            catalog,
+            overlay,
+            n_neighbors=neighbor_rank,
+            test_fraction=test_fraction,
+            n_splits=n_splits,
+            seed=seed,
+            catalog_id_column=catalog_id_column,
+        )
+
+        summary = dict(result["summary"])
+        summary["target_neighbor_rank"] = neighbor_rank
+        summary_rows.append(summary)
+
+        curve = result["curve"].copy()
+        curve["target_neighbor_rank"] = neighbor_rank
+        curve_frames.append(curve)
+
+        split_summary = result["split_summaries"].copy()
+        split_summary["target_neighbor_rank"] = neighbor_rank
+        split_summary_frames.append(split_summary)
+
+        split_curve = result["split_curves"].copy()
+        split_curve["target_neighbor_rank"] = neighbor_rank
+        split_curve_frames.append(split_curve)
+
+    return {
+        "summary": pd.DataFrame(summary_rows),
+        "curves": pd.concat(curve_frames, ignore_index=True),
+        "split_summaries": pd.concat(split_summary_frames, ignore_index=True),
+        "split_curves": pd.concat(split_curve_frames, ignore_index=True),
+        "neighbor_ranks": ranks,
+    }
+
+
+def paired_neighbor_rank_differences(
+    split_summaries: Any,
+    metric: str = "average_precision",
+    comparisons: Sequence[tuple[int, int]] | None = None,
+):
+    """Compare neighbor ranks using paired split-level metric differences."""
+    init_tabular_stack()
+    if not isinstance(split_summaries, pd.DataFrame):
+        raise TypeError("split_summaries must be a pandas DataFrame")
+    required = {"split_index", "target_neighbor_rank", metric}
+    missing = sorted(required.difference(split_summaries.columns))
+    if missing:
+        raise KeyError(f"split_summaries is missing required columns: {missing}")
+
+    duplicated = split_summaries.duplicated(
+        ["split_index", "target_neighbor_rank"],
+        keep=False,
+    )
+    if duplicated.any():
+        raise ValueError(
+            "split_summaries must contain one row per split and neighbor rank; "
+            "filter to one run/experiment/overlay before comparing"
+        )
+
+    paired = split_summaries.pivot(
+        index="split_index",
+        columns="target_neighbor_rank",
+        values=metric,
+    ).sort_index(axis=1)
+    ranks = [int(value) for value in paired.columns]
+    if comparisons is None:
+        comparisons = list(zip(ranks[:-1], ranks[1:]))
+
+    rows = []
+    for lower, higher in comparisons:
+        lower = int(lower)
+        higher = int(higher)
+        missing_ranks = [rank for rank in (lower, higher) if rank not in paired]
+        if missing_ranks:
+            raise KeyError(
+                f"Comparison {(lower, higher)} references unavailable ranks "
+                f"{missing_ranks}; available ranks are {ranks}"
+            )
+        difference = (paired[higher] - paired[lower]).dropna()
+        if difference.empty:
+            raise ValueError(
+                f"Comparison {(lower, higher)} has no paired finite observations"
+            )
+        rows.append(
+            {
+                "comparison": f"{higher} minus {lower}",
+                "lower_neighbor_rank": lower,
+                "higher_neighbor_rank": higher,
+                "metric": metric,
+                "n_paired_splits": len(difference),
+                "median_change": float(difference.median()),
+                "change_p16": float(difference.quantile(0.16)),
+                "change_p84": float(difference.quantile(0.84)),
+                "fraction_splits_improved": float((difference > 0).mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def purity_at_fixed_completeness(
+    sweep_curves: Any,
+    completeness_values: Sequence[float] = (0.1, 0.2, 0.3),
+):
+    """Read median purity bands from sweep curves at requested completeness."""
+    init_tabular_stack()
+    if not isinstance(sweep_curves, pd.DataFrame):
+        raise TypeError("sweep_curves must be a pandas DataFrame")
+    required = {
+        "target_neighbor_rank",
+        "completeness",
+        "purity",
+        "purity_p16",
+        "purity_p84",
+    }
+    missing = sorted(required.difference(sweep_curves.columns))
+    if missing:
+        raise KeyError(f"sweep_curves is missing required columns: {missing}")
+
+    requested = []
+    for value in completeness_values:
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError("completeness values must be finite numbers from 0 to 1")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "completeness values must be finite numbers from 0 to 1"
+            ) from exc
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError("completeness values must lie between 0 and 1")
+        requested.append(value)
+
+    rows = []
+    for neighbor_rank, curve in sweep_curves.groupby(
+        "target_neighbor_rank",
+        sort=True,
+    ):
+        for requested_completeness in requested:
+            position = (
+                curve["completeness"] - requested_completeness
+            ).abs().to_numpy().argmin()
+            point = curve.iloc[int(position)]
+            rows.append(
+                {
+                    "target_neighbor_rank": int(neighbor_rank),
+                    "requested_completeness": requested_completeness,
+                    "completeness": float(point["completeness"]),
+                    "purity": float(point["purity"]),
+                    "purity_p16": float(point["purity_p16"]),
+                    "purity_p84": float(point["purity_p84"]),
+                    "distance_threshold": float(point["distance_threshold"]),
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def select_distance_operating_point(
+    curve: Any,
+    objective: str = "max_f1",
+    min_purity: float | None = None,
+    min_completeness: float | None = None,
+) -> dict[str, Any]:
+    """Choose one distance threshold using validation data only.
+
+    Supported objectives are ``max_f1``, ``max_completeness_at_purity``, and
+    ``max_purity_at_completeness``. If a requested constraint is unattainable,
+    the maximum-F1 point is returned with ``constraint_met=False`` so the
+    failure remains visible without aborting a repeated analysis.
+    """
+    init_tabular_stack()
+    if not isinstance(curve, pd.DataFrame):
+        raise TypeError("curve must be a pandas DataFrame")
+    required = {
+        "distance_threshold",
+        "n_selected",
+        "completeness",
+        "purity",
+        "f1",
+    }
+    missing = sorted(required.difference(curve.columns))
+    if missing:
+        raise KeyError(f"curve is missing required columns: {missing}")
+
+    work = curve.loc[
+        curve["n_selected"].gt(0)
+        & np.isfinite(pd.to_numeric(curve["distance_threshold"], errors="coerce"))
+    ].copy()
+    if work.empty:
+        raise ValueError("curve has no non-empty finite operating points")
+
+    valid_objectives = {
+        "max_f1",
+        "max_completeness_at_purity",
+        "max_purity_at_completeness",
+    }
+    if objective not in valid_objectives:
+        raise ValueError(
+            f"objective must be one of {sorted(valid_objectives)}; got {objective!r}"
+        )
+
+    constraint_met = True
+    if objective == "max_completeness_at_purity":
+        if min_purity is None:
+            raise ValueError(
+                "min_purity is required for max_completeness_at_purity"
+            )
+        min_purity = float(min_purity)
+        if not math.isfinite(min_purity) or not 0.0 <= min_purity <= 1.0:
+            raise ValueError("min_purity must lie between 0 and 1")
+        candidates = work.loc[work["purity"] >= min_purity]
+        sort_columns = ["completeness", "purity", "f1", "distance_threshold"]
+        ascending = [False, False, False, True]
+    elif objective == "max_purity_at_completeness":
+        if min_completeness is None:
+            raise ValueError(
+                "min_completeness is required for max_purity_at_completeness"
+            )
+        min_completeness = float(min_completeness)
+        if (
+            not math.isfinite(min_completeness)
+            or not 0.0 <= min_completeness <= 1.0
+        ):
+            raise ValueError("min_completeness must lie between 0 and 1")
+        candidates = work.loc[work["completeness"] >= min_completeness]
+        sort_columns = ["purity", "completeness", "f1", "distance_threshold"]
+        ascending = [False, False, False, True]
+    else:
+        candidates = work
+        sort_columns = ["f1", "purity", "completeness", "distance_threshold"]
+        ascending = [False, False, False, True]
+
+    if candidates.empty:
+        constraint_met = False
+        candidates = work
+        sort_columns = ["f1", "purity", "completeness", "distance_threshold"]
+        ascending = [False, False, False, True]
+
+    selected = candidates.sort_values(
+        sort_columns,
+        ascending=ascending,
+        kind="stable",
+    ).iloc[0]
+    result = selected.to_dict()
+    result.update(
+        {
+            "validation_objective": objective,
+            "constraint_met": constraint_met,
+            "min_purity": min_purity,
+            "min_completeness": min_completeness,
+        }
+    )
+    return result
+
+
+def fixed_distance_selection_summary(
+    distances: Any,
+    target_mask: Any,
+    evaluation_mask: Any,
+    distance_threshold: float,
+) -> dict[str, Any]:
+    """Score one fixed distance threshold on an evaluation population."""
+    init_tabular_stack()
+    distances = np.asarray(distances, dtype=float)
+    if distances.ndim != 1:
+        raise ValueError(
+            f"distances must be one-dimensional; got shape {distances.shape}"
+        )
+    n_points = len(distances)
+    target_mask = _validated_boolean_mask(target_mask, n_points, "target_mask")
+    evaluation_mask = _validated_boolean_mask(
+        evaluation_mask,
+        n_points,
+        "evaluation_mask",
+    )
+    try:
+        distance_threshold = float(distance_threshold)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("distance_threshold must be a finite non-negative number") from exc
+    if not math.isfinite(distance_threshold) or distance_threshold < 0.0:
+        raise ValueError("distance_threshold must be a finite non-negative number")
+
+    n_evaluated = int(evaluation_mask.sum())
+    n_targets = int(np.sum(evaluation_mask & target_mask))
+    if n_evaluated == 0:
+        raise ValueError("evaluation_mask does not select any points")
+    if n_targets == 0:
+        raise ValueError("target_mask does not select any evaluated targets")
+
+    scored_mask = evaluation_mask & np.isfinite(distances)
+    selection_mask = scored_mask & (distances <= distance_threshold)
+    n_selected = int(selection_mask.sum())
+    true_positives = int(np.sum(selection_mask & target_mask))
+    false_positives = n_selected - true_positives
+    false_negatives = n_targets - true_positives
+    true_negatives = n_evaluated - true_positives - false_positives - false_negatives
+    completeness = float(true_positives / n_targets)
+    prevalence = float(n_targets / n_evaluated)
+
+    if n_selected == 0:
+        purity = np.nan
+        f1 = 0.0
+        lift = np.nan
+    else:
+        purity = float(true_positives / n_selected)
+        denominator = completeness + purity
+        f1 = float(2.0 * completeness * purity / denominator) if denominator else 0.0
+        lift = float(purity / prevalence)
+
+    return {
+        "distance_threshold": distance_threshold,
+        "n_evaluated": n_evaluated,
+        "n_scored": int(scored_mask.sum()),
+        "n_targets": n_targets,
+        "prevalence": prevalence,
+        "n_selected": n_selected,
+        "true_positives": true_positives,
+        "false_positives": false_positives,
+        "false_negatives": false_negatives,
+        "true_negatives": true_negatives,
+        "completeness": completeness,
+        "purity": purity,
+        "f1": f1,
+        "lift": lift,
+        "selection_mask": selection_mask,
+    }
+
+
+def _largest_remainder_counts(n_items: int, fractions: Sequence[float]) -> list[int]:
+    """Allocate an integer class count while preserving requested fractions."""
+    raw = np.asarray(fractions, dtype=float) * int(n_items)
+    counts = np.floor(raw).astype(int)
+    remainder = int(n_items - counts.sum())
+    order = np.argsort(-(raw - counts), kind="stable")
+    for position in order[:remainder]:
+        counts[position] += 1
+    if np.any(counts < 1):
+        raise ValueError(
+            f"Cannot divide {n_items} class members across fractions {fractions}; "
+            "each partition needs at least one member"
+        )
+    return counts.tolist()
+
+
+def _partition_shuffled_indices(
+    indices: Any,
+    counts: Sequence[int],
+    rng: Any,
+) -> list[Any]:
+    shuffled = rng.permutation(np.asarray(indices, dtype=int))
+    boundaries = np.cumsum([0, *counts])
+    return [
+        shuffled[boundaries[index] : boundaries[index + 1]]
+        for index in range(len(counts))
+    ]
+
+
+def compute_overlay_nested_completeness_purity(
+    umap_data: Mapping[str, Any],
+    catalog: Any,
+    overlay: Mapping[str, Any],
+    neighbor_ranks: Any = (7,),
+    train_fraction: float = 0.5,
+    validation_fraction: float = 0.25,
+    n_splits: int = 100,
+    seed: int = 42,
+    validation_objective: str = "max_f1",
+    min_validation_purity: float | None = None,
+    min_validation_completeness: float | None = None,
+    permute_labels: bool = False,
+    catalog_id_column: str | None = None,
+) -> dict[str, Any]:
+    """Select neighbor rank and radius on validation data, then score test data.
+
+    Every repetition stratifies known targets and non-targets into training,
+    validation, and test populations. Training targets are the only anchors.
+    Validation average precision chooses the neighbor rank, and
+    ``validation_objective`` chooses its radius. The selected pair is frozen
+    before any test metric is calculated.
+
+    Set ``permute_labels=True`` for a label-shuffled negative control that
+    preserves class prevalence.
+    """
+    init_tabular_stack()
+    ranks = _validated_neighbor_ranks(neighbor_ranks)
+    if not isinstance(permute_labels, (bool, np.bool_)):
+        raise TypeError("permute_labels must be boolean")
+
+    fractions = []
+    for name, value in (
+        ("train_fraction", train_fraction),
+        ("validation_fraction", validation_fraction),
+    ):
+        if isinstance(value, (bool, np.bool_)):
+            raise TypeError(f"{name} must be a finite number between 0 and 1")
+        try:
+            value = float(value)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"{name} must be a finite number between 0 and 1"
+            ) from exc
+        if not math.isfinite(value) or not 0.0 < value < 1.0:
+            raise ValueError(f"{name} must be strictly between 0 and 1")
+        fractions.append(value)
+    train_fraction, validation_fraction = fractions
+    test_fraction = 1.0 - train_fraction - validation_fraction
+    if test_fraction <= 0.0:
+        raise ValueError("train_fraction + validation_fraction must be less than 1")
+
+    if isinstance(n_splits, (bool, np.bool_)) or not isinstance(
+        n_splits,
+        (int, np.integer),
+    ):
+        raise TypeError("n_splits must be a positive integer")
+    n_splits = int(n_splits)
+    if n_splits < 1:
+        raise ValueError("n_splits must be at least 1")
+    if isinstance(seed, (bool, np.bool_)) or not isinstance(
+        seed,
+        (int, np.integer),
+    ):
+        raise TypeError("seed must be an integer")
+    seed = int(seed)
+
+    if catalog is None:
+        raise ValueError("A catalog DataFrame is required for nested analysis.")
+    if not isinstance(overlay, Mapping):
+        raise TypeError("overlay must be a mapping specification")
+    for coordinate in ("x", "y", "rubin_ids"):
+        if coordinate not in umap_data:
+            raise KeyError(f"umap_data must contain a '{coordinate}' array")
+
+    resolved_id_column = resolve_catalog_id_column(catalog, catalog_id_column)
+    coords = _as_2d_numeric_array(
+        np.column_stack([umap_data["x"], umap_data["y"]]),
+        name="UMAP coordinates",
+    )
+    if len(umap_data["rubin_ids"]) != len(coords):
+        raise ValueError(
+            "UMAP coordinates and rubin_ids must have the same length: "
+            f"{len(coords)} vs {len(umap_data['rubin_ids'])}"
+        )
+
+    evaluation_mask = overlay_evaluation_mask(
+        umap_data,
+        catalog,
+        overlay,
+        catalog_id_column=resolved_id_column,
+    )
+    original_target_mask = overlay_labeled_mask(
+        umap_data,
+        catalog,
+        overlay,
+        catalog_id_column=resolved_id_column,
+    )
+    original_target_mask &= evaluation_mask
+    evaluated_indices = np.flatnonzero(evaluation_mask)
+    n_targets_total = int(original_target_mask.sum())
+    n_non_targets_total = int(evaluation_mask.sum()) - n_targets_total
+    class_fractions = [train_fraction, validation_fraction, test_fraction]
+    target_counts = _largest_remainder_counts(n_targets_total, class_fractions)
+    non_target_counts = _largest_remainder_counts(
+        n_non_targets_total,
+        class_fractions,
+    )
+    if target_counts[0] < max(ranks):
+        raise ValueError(
+            "The training partition needs at least the maximum neighbor rank in "
+            f"target anchors; got {target_counts[0]} training targets for ranks {ranks}"
+        )
+
+    rng = np.random.default_rng(seed)
+    n_points = len(coords)
+    split_rows = []
+    validation_curve_frames = []
+    test_curve_frames = []
+    split_train_masks = np.zeros((n_splits, n_points), dtype=bool)
+    split_validation_masks = np.zeros((n_splits, n_points), dtype=bool)
+    split_test_masks = np.zeros((n_splits, n_points), dtype=bool)
+    split_anchor_masks = np.zeros((n_splits, n_points), dtype=bool)
+
+    for split_index in range(n_splits):
+        if permute_labels:
+            working_target_mask = np.zeros(n_points, dtype=bool)
+            permuted_indices = rng.permutation(evaluated_indices)
+            working_target_mask[permuted_indices[:n_targets_total]] = True
+        else:
+            working_target_mask = original_target_mask
+
+        target_indices = np.flatnonzero(evaluation_mask & working_target_mask)
+        non_target_indices = np.flatnonzero(evaluation_mask & ~working_target_mask)
+        target_parts = _partition_shuffled_indices(target_indices, target_counts, rng)
+        non_target_parts = _partition_shuffled_indices(
+            non_target_indices,
+            non_target_counts,
+            rng,
+        )
+
+        partition_masks = []
+        for target_part, non_target_part in zip(
+            target_parts,
+            non_target_parts,
+            strict=True,
+        ):
+            mask = np.zeros(n_points, dtype=bool)
+            mask[np.concatenate([target_part, non_target_part])] = True
+            partition_masks.append(mask)
+        train_mask, validation_mask, test_mask = partition_masks
+        anchor_mask = train_mask & working_target_mask
+
+        candidates = []
+        for neighbor_rank in ranks:
+            validation_distances = nearest_anchor_distances(
+                coords,
+                anchor_mask,
+                evaluation_mask=validation_mask,
+                n_neighbors=neighbor_rank,
+            )
+            validation_curve, validation_summary = distance_completeness_purity_curve(
+                validation_distances,
+                working_target_mask,
+                evaluation_mask=validation_mask,
+            )
+            operating_point = select_distance_operating_point(
+                validation_curve,
+                objective=validation_objective,
+                min_purity=min_validation_purity,
+                min_completeness=min_validation_completeness,
+            )
+            candidates.append(
+                {
+                    "target_neighbor_rank": neighbor_rank,
+                    "validation_average_precision": validation_summary[
+                        "average_precision"
+                    ],
+                    "validation_ap_lift": validation_summary["ap_lift"],
+                    "operating_point": operating_point,
+                }
+            )
+            validation_curve = validation_curve.copy()
+            validation_curve["split_index"] = split_index
+            validation_curve["target_neighbor_rank"] = neighbor_rank
+            validation_curve_frames.append(validation_curve)
+
+        selected_candidate = sorted(
+            candidates,
+            key=lambda item: (
+                -item["validation_average_precision"],
+                item["target_neighbor_rank"],
+            ),
+        )[0]
+        selected_rank = int(selected_candidate["target_neighbor_rank"])
+        operating_point = selected_candidate["operating_point"]
+        distance_threshold = float(operating_point["distance_threshold"])
+
+        test_distances = nearest_anchor_distances(
+            coords,
+            anchor_mask,
+            evaluation_mask=test_mask,
+            n_neighbors=selected_rank,
+        )
+        test_curve, test_ranking_summary = distance_completeness_purity_curve(
+            test_distances,
+            working_target_mask,
+            evaluation_mask=test_mask,
+        )
+        test_fixed = fixed_distance_selection_summary(
+            test_distances,
+            working_target_mask,
+            test_mask,
+            distance_threshold,
+        )
+        test_curve = test_curve.copy()
+        test_curve["split_index"] = split_index
+        test_curve["target_neighbor_rank"] = selected_rank
+        test_curve["validation_distance_threshold"] = distance_threshold
+        test_curve_frames.append(test_curve)
+
+        row = {
+            "split_index": split_index,
+            "permuted_labels": bool(permute_labels),
+            "selected_neighbor_rank": selected_rank,
+            "distance_threshold": distance_threshold,
+            "validation_objective": validation_objective,
+            "validation_constraint_met": bool(operating_point["constraint_met"]),
+            "validation_average_precision": float(
+                selected_candidate["validation_average_precision"]
+            ),
+            "validation_ap_lift": float(selected_candidate["validation_ap_lift"]),
+            "validation_completeness": float(operating_point["completeness"]),
+            "validation_purity": float(operating_point["purity"]),
+            "validation_f1": float(operating_point["f1"]),
+            "test_average_precision": float(
+                test_ranking_summary["average_precision"]
+            ),
+            "test_ap_lift": float(test_ranking_summary["ap_lift"]),
+            "n_known_total": int(evaluation_mask.sum()),
+            "n_targets_total": n_targets_total,
+            "n_train": int(train_mask.sum()),
+            "n_train_targets": int(np.sum(train_mask & working_target_mask)),
+            "n_validation": int(validation_mask.sum()),
+            "n_validation_targets": int(
+                np.sum(validation_mask & working_target_mask)
+            ),
+            "n_test": int(test_mask.sum()),
+            "n_test_targets": int(np.sum(test_mask & working_target_mask)),
+        }
+        for key in (
+            "prevalence",
+            "n_selected",
+            "true_positives",
+            "false_positives",
+            "false_negatives",
+            "true_negatives",
+            "completeness",
+            "purity",
+            "f1",
+            "lift",
+        ):
+            row[f"test_{key}"] = test_fixed[key]
+        split_rows.append(row)
+
+        split_train_masks[split_index] = train_mask
+        split_validation_masks[split_index] = validation_mask
+        split_test_masks[split_index] = test_mask
+        split_anchor_masks[split_index] = anchor_mask
+
+    split_results = pd.DataFrame(split_rows)
+    rank_counts = split_results["selected_neighbor_rank"].value_counts().sort_index()
+    selected_rank_mode = int(rank_counts[rank_counts.eq(rank_counts.max())].index.min())
+    summary = {
+        "evaluation_scheme": "nested_stratified_train_validation_test",
+        "permuted_labels": bool(permute_labels),
+        "n_splits": n_splits,
+        "seed": seed,
+        "neighbor_ranks": ranks,
+        "selected_neighbor_rank_mode": selected_rank_mode,
+        "selected_neighbor_rank_counts": {
+            int(rank): int(count) for rank, count in rank_counts.items()
+        },
+        "train_fraction": train_fraction,
+        "validation_fraction": validation_fraction,
+        "test_fraction": test_fraction,
+        "validation_objective": validation_objective,
+        "min_validation_purity": min_validation_purity,
+        "min_validation_completeness": min_validation_completeness,
+        "fraction_validation_constraint_met": float(
+            split_results["validation_constraint_met"].mean()
+        ),
+        "n_known_total": int(evaluation_mask.sum()),
+        "n_targets_total": n_targets_total,
+        "n_train": int(split_results.iloc[0]["n_train"]),
+        "n_train_targets": int(split_results.iloc[0]["n_train_targets"]),
+        "n_validation": int(split_results.iloc[0]["n_validation"]),
+        "n_validation_targets": int(
+            split_results.iloc[0]["n_validation_targets"]
+        ),
+        "n_test": int(split_results.iloc[0]["n_test"]),
+        "n_test_targets": int(split_results.iloc[0]["n_test_targets"]),
+    }
+    aggregate_metrics = [
+        "distance_threshold",
+        "validation_average_precision",
+        "validation_ap_lift",
+        "validation_completeness",
+        "validation_purity",
+        "validation_f1",
+        "test_average_precision",
+        "test_ap_lift",
+        "test_prevalence",
+        "test_n_selected",
+        "test_completeness",
+        "test_purity",
+        "test_f1",
+        "test_lift",
+    ]
+    for metric in aggregate_metrics:
+        values = pd.to_numeric(split_results[metric], errors="coerce").to_numpy(
+            dtype=float
+        )
+        finite = values[np.isfinite(values)]
+        if len(finite) == 0:
+            median = lower = upper = np.nan
+        else:
+            median, lower, upper = np.quantile(finite, [0.5, 0.16, 0.84])
+        summary[metric] = float(median)
+        summary[f"{metric}_p16"] = float(lower)
+        summary[f"{metric}_p84"] = float(upper)
+
+    return {
+        "summary": summary,
+        "split_results": split_results,
+        "validation_curves": pd.concat(
+            validation_curve_frames,
+            ignore_index=True,
+        ),
+        "test_curves": pd.concat(test_curve_frames, ignore_index=True),
+        "split_train_masks": split_train_masks,
+        "split_validation_masks": split_validation_masks,
+        "split_test_masks": split_test_masks,
+        "split_anchor_masks": split_anchor_masks,
+        "target_mask": original_target_mask,
+        "evaluation_mask": evaluation_mask,
+        "catalog_id_column": resolved_id_column,
+    }
+
+
+def compare_nested_permutation_baseline(
+    observed_split_results: Any,
+    permuted_split_results: Any,
+    metrics: Sequence[str] = (
+        "test_average_precision",
+        "test_f1",
+        "test_purity",
+    ),
+):
+    """Compare nested test metrics with a label-permuted control.
+
+    The null exceedance fraction is descriptive: it compares the observed
+    median with split-level shuffled results. It is not presented as a formal
+    permutation p-value because each split reuses much of the same dataset.
+    """
+    init_tabular_stack()
+    for name, frame in (
+        ("observed_split_results", observed_split_results),
+        ("permuted_split_results", permuted_split_results),
+    ):
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"{name} must be a pandas DataFrame")
+
+    rows = []
+    for metric in metrics:
+        if metric not in observed_split_results.columns:
+            raise KeyError(f"Observed results do not contain metric {metric!r}")
+        if metric not in permuted_split_results.columns:
+            raise KeyError(f"Permuted results do not contain metric {metric!r}")
+        observed = pd.to_numeric(
+            observed_split_results[metric],
+            errors="coerce",
+        ).dropna()
+        null = pd.to_numeric(
+            permuted_split_results[metric],
+            errors="coerce",
+        ).dropna()
+        if observed.empty or null.empty:
+            raise ValueError(f"Metric {metric!r} has no finite observed or null values")
+        observed_median = float(observed.median())
+        null_median = float(null.median())
+        rows.append(
+            {
+                "metric": metric,
+                "observed_median": observed_median,
+                "observed_p16": float(observed.quantile(0.16)),
+                "observed_p84": float(observed.quantile(0.84)),
+                "permuted_median": null_median,
+                "permuted_p16": float(null.quantile(0.16)),
+                "permuted_p84": float(null.quantile(0.84)),
+                "median_difference": observed_median - null_median,
+                "null_exceedance_fraction": float(
+                    (int(np.sum(null.to_numpy() >= observed_median)) + 1)
+                    / (len(null) + 1)
+                ),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def compute_overlay_metrics(
     umap_data: Mapping[str, Any],
     catalog: Any,
@@ -2108,6 +2928,85 @@ def write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_jsonable(payload), indent=2, sort_keys=True), encoding="utf-8")
     print(f"Wrote JSON: {path}")
+
+
+def save_analysis_bundle(
+    output_dir: str | Path,
+    tables: Mapping[str, Any],
+    config: Mapping[str, Any],
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Path]:
+    """Save named DataFrames plus a configuration manifest for later reuse."""
+    init_tabular_stack()
+    if not isinstance(tables, Mapping) or not tables:
+        raise ValueError("tables must be a non-empty mapping of names to DataFrames")
+    if not isinstance(config, Mapping):
+        raise TypeError("config must be a mapping")
+    if metadata is not None and not isinstance(metadata, Mapping):
+        raise TypeError("metadata must be a mapping when provided")
+
+    output_dir = Path(output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    table_files = {}
+    written_paths = {}
+    for name, frame in tables.items():
+        name = str(name)
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
+            raise ValueError(
+                f"Invalid table name {name!r}; use letters, digits, underscores, or hyphens"
+            )
+        if not isinstance(frame, pd.DataFrame):
+            raise TypeError(f"Table {name!r} must be a pandas DataFrame")
+        filename = f"{name}.csv"
+        path = output_dir / filename
+        frame.to_csv(path, index=False)
+        table_files[name] = filename
+        written_paths[name] = path
+
+    manifest_path = output_dir / "analysis_manifest.json"
+    write_json(
+        manifest_path,
+        {
+            "config": config,
+            "metadata": metadata or {},
+            "tables": table_files,
+        },
+    )
+    written_paths["manifest"] = manifest_path
+    return written_paths
+
+
+def load_analysis_bundle(
+    output_dir: str | Path,
+    expected_config: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Load a saved analysis bundle and optionally verify its configuration."""
+    init_tabular_stack()
+    output_dir = Path(output_dir).expanduser()
+    manifest_path = output_dir / "analysis_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Analysis manifest not found: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if expected_config is not None:
+        if not isinstance(expected_config, Mapping):
+            raise TypeError("expected_config must be a mapping when provided")
+        if _jsonable(expected_config) != manifest.get("config"):
+            raise ValueError(
+                f"Saved analysis configuration does not match the requested config: {output_dir}"
+            )
+
+    tables = {}
+    for name, filename in manifest.get("tables", {}).items():
+        path = output_dir / str(filename)
+        if not path.exists():
+            raise FileNotFoundError(f"Saved analysis table not found: {path}")
+        tables[name] = pd.read_csv(path)
+    return {
+        "config": manifest.get("config", {}),
+        "metadata": manifest.get("metadata", {}),
+        "tables": tables,
+        "manifest_path": manifest_path,
+    }
 
 
 def resolve_selected_overlay_groups(
