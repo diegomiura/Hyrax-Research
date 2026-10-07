@@ -21,3 +21,6 @@ data/skirt_images_hsc_idealized_v0_72.hdf5
 /data/*.hdf5
 /config.toml
 /cutout_size_histogram.png
+
+aritra_meeting_notes.md
+paper_skeleton.tex
